@@ -43,6 +43,7 @@ def safe_reason(value):
         "inventory_empty",
         "inventory_marked_used",
         "inventory_removed_from_manifest",
+        "card_pool_changed",
         "cancelled_during_send",
         "cancelled_after_send_attempt",
         "manual_takeover_before_send",

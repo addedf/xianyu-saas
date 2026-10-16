@@ -704,9 +704,7 @@ class OperationsTools:
                 return digest(["material", item.get("material")])
             if item["delivery"] == "pan":
                 return digest(["pan", sorted(item["tags"])])
-            # All redeem templates bind the one existing account inventory;
-            # they are not separate pools from which a model may invent a choice.
-            return "inventory:redeem"
+            return "inventory:" + item.get("card_pool_id", "redeem")
         choices = {binding(item) for item in candidates}
         if len(choices) != 1 or binding(resource) not in choices:
             raise OperationsToolError("clarification_required", message="资源名称匹配多份资料或用户未明确选择该资源，请补充名称或标签，不会猜测绑定")

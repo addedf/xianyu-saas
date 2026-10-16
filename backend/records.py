@@ -2161,6 +2161,7 @@ _ORDER_STATUS_LABELS = {
 _ORDER_REASONS = {
     "inventory_empty": "库存不足，请核对后处理",
     "inventory_marked_used": "关联库存已使用", "inventory_removed_from_manifest": "关联库存已移除",
+    "card_pool_changed": "商品绑定的卡密池已变化，请核对原预占卡密后处理",
     "inventory_state_changed": "库存状态已变化", "ack_timeout": "平台确认超时，请先核对发送结果",
     "manual_takeover_before_send": "会话已由人工接管", "platform_order_identity_unavailable": "平台订单号尚未确认",
     "chat_binding_unavailable": "会话关联尚未确认", "order_not_awaiting_shipment": "核验时订单不处于待发货状态",

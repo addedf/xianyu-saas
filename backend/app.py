@@ -37,6 +37,7 @@ from account_storage import AccountStorage, AccountStorageError, AccountStorageR
 from account_leases import AccountLease, AccountLeaseError, acquire_account_lease
 from fulfillment_config import (
     FulfillmentConfig, FulfillmentConfigError,
+    card_pool_id,
     normalise_template_input, normalise_template_item_ids, template_public,
     upsert_template, remove_template, digest as fulfillment_digest, has_enabled_delivery,
 )
@@ -1545,6 +1546,7 @@ class TemplateItemIn(BaseModel):
     delivery: str = ""
     item_ids: list | None = None
     resource_match: list | None = None
+    card_pool_id: str | None = None
     enabled: bool | None = None
 
     class Config:
@@ -1556,6 +1558,8 @@ class TemplateIn(BaseModel):
 
 
 class CardsIn(BaseModel):
+    pool_id: str | None = None
+    create: bool = False
     name: str = ""
     note: str = ""
     codes: list = []
@@ -5160,6 +5164,14 @@ def save_codes(
 
 
 def _save_codes_locked(body: CodesIn, user, account):
+    account_key = str(account["account_key"])
+    try:
+        pools, _codes = fulfillment_config.read_cards(user["id"], account_key)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+    if any(pool["id"] != "redeem" for pool in pools):
+        raise HTTPException(409, "此旧接口仅支持单卡密池，请在卡密库存选择卡密池后导入")
+    previous_used = {entry["code"] for entry in _codes if entry["used"]}
     if not isinstance(body.codes, list) or not body.codes or len(body.codes) > 20000:
         raise HTTPException(400, "码列表格式错误")
     cleaned = []
@@ -5172,18 +5184,19 @@ def _save_codes_locked(body: CodesIn, user, account):
         cleaned.append(
             {
                 "code": code,
+                "pool_id": "redeem",
                 "value": 5,
-                "used": bool(item.get("used", False)) if isinstance(item, dict) else False,
+                "used": code in previous_used or (bool(item.get("used", False)) if isinstance(item, dict) else False),
             }
         )
     if not cleaned:
         raise HTTPException(400, "没有有效码")
-    write_secret(
-        user["id"],
-        "redeem_codes.json",
-        json.dumps(cleaned, ensure_ascii=False),
-        str(account["account_key"]),
-    )
+    try:
+        with AccountStorage().compensating_write(user["id"], account_key, ("redeem_codes.json", "card_pools.json")) as write:
+            write("card_pools.json", json.dumps({"version": 1, "pools": pools or [{"id": "redeem", "name": "兑换码池", "note": ""}]}, ensure_ascii=False))
+            write("redeem_codes.json", json.dumps(cleaned, ensure_ascii=False))
+    except (OSError, AccountStorageError) as error:
+        raise HTTPException(503, "卡密保存失败，请稍后重试") from error
     return {"ok": True, "codes": len(cleaned)}
 
 
@@ -5225,6 +5238,7 @@ def _save_products_locked(body: ProductsIn, user, account, lease=None):
         for item in (snapshot or {}).get("products", [])
         if isinstance(item, dict) and str(item.get("id") or "").isdigit()
     }
+    pool_ids = None
     for raw_item in types:
         if not isinstance(raw_item, dict) or raw_item.get("delivery") not in {"redeem", "pan"}:
             raise HTTPException(400, "type 配置无效(delivery 只能是 redeem/pan)")
@@ -5256,6 +5270,18 @@ def _save_products_locked(body: ProductsIn, user, account, lease=None):
             if not isinstance(tags, list) or not tags or not all(isinstance(tag, str) and tag.strip() for tag in tags):
                 raise HTTPException(400, "网盘商品必须配置资源匹配标签")
             item["resource_match"] = [tag.strip()[:120] for tag in tags[:32]]
+            item.pop("card_pool_id", None)
+        else:
+            try:
+                if pool_ids is None:
+                    pools, _codes = fulfillment_config.read_cards(user["id"], account_key)
+                    pool_ids = {pool["id"] for pool in pools}
+                previous = next((entry for entry in before["types"] if item.get("id") is not None and entry.get("id") == item["id"]), {})
+                item["card_pool_id"] = card_pool_id(item.get("card_pool_id", previous.get("card_pool_id", "redeem")))
+                if item["card_pool_id"] not in pool_ids:
+                    raise FulfillmentConfigError(message="请选择当前店铺已有的卡密池")
+            except FulfillmentConfigError as error:
+                raise HTTPException(error.status_code, str(error)) from error
         normalized_types.append(item)
     normalized_products = dict(products)
     normalized_products["types"] = normalized_types
@@ -5346,6 +5372,10 @@ def _save_template_locked(body: TemplateIn, user, account, lease=None):
     try:
         updated, persisted = upsert_template(document, body.template.model_dump(), snapshot,
             new_id=f"template-{uuid.uuid4().hex[:8]}")
+        if persisted["delivery"] == "redeem":
+            pools, _codes = fulfillment_config.read_cards(user["id"], account_key)
+            if not any(pool["id"] == persisted["card_pool_id"] for pool in pools):
+                raise FulfillmentConfigError(message="请选择当前店铺已有的卡密池；可先到卡密库存新建")
     except FulfillmentConfigError as error:
         raise HTTPException(error.status_code, str(error)) from error
     _write_products_document(user["id"], account_key, updated, before=document,
@@ -5389,70 +5419,6 @@ def _delete_template_locked(template_id: str, user, account, lease=None):
     return {"ok": True}
 
 
-def _read_codes(user_id: int, account_key: str) -> list:
-    raw = read_secret(user_id, "redeem_codes.json", account_key)
-    if not raw:
-        return []
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return []
-    if not isinstance(payload, list):
-        return []
-    return payload
-
-
-def _read_card_pool_meta(user_id: int, account_key: str) -> dict:
-    raw = read_secret(user_id, "card_pool.json", account_key)
-    if not raw:
-        return {"name": "兑换码池", "note": ""}
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
-        return {"name": "兑换码池", "note": ""}
-    if not isinstance(payload, dict):
-        return {"name": "兑换码池", "note": ""}
-    name = str(payload.get("name") or "").strip() or "兑换码池"
-    note = str(payload.get("note") or "").strip()
-    return {"name": name[:120], "note": note[:500]}
-
-
-def _cards_payload(
-    codes: list,
-    name: str = "兑换码池",
-    note: str = "",
-    runtime_counts: dict | None = None,
-) -> dict:
-    valid = [item for item in codes if isinstance(item, dict) and item.get("code")]
-    if runtime_counts is None:
-        total = len(valid)
-        available = sum(1 for item in valid if not item.get("used"))
-        reserved = 0
-        used = total - available
-    else:
-        available = int(runtime_counts.get("available", 0))
-        reserved = int(runtime_counts.get("reserved", 0))
-        used = int(runtime_counts.get("delivered", 0)) + int(runtime_counts.get("legacy_used", 0))
-        total = available + reserved + used
-    pool = {
-        "id": "redeem",
-        "name": name,
-        "note": note,
-        "total": total,
-        "available": available,
-        "used": used,
-        "enabled": True,
-    }
-    stats = {
-        "pools": 1,
-        "total": total,
-        "available": available,
-        "reserved": reserved,
-        "used": used,
-    }
-    return {"pool": pool, "stats": stats}
-
-
 @app.get("/api/bot/cards")
 def get_cards(
     user=Depends(Auth.current_user),
@@ -5460,19 +5426,10 @@ def get_cards(
 ):
     _require_permission(user, "fulfillment.manage")
     account_key = str(account["account_key"])
-    codes = _read_codes(user["id"], account_key)
-    meta = _read_card_pool_meta(user["id"], account_key)
-    runtime_counts = (
-        records.inventory_counts(user["id"], "redeem", account_key)
-        if bot_status(user["id"], account_key).get("running")
-        else None
-    )
-    return _cards_payload(
-        codes,
-        name=meta["name"],
-        note=meta["note"],
-        runtime_counts=runtime_counts,
-    )
+    try:
+        return fulfillment_config.cards_payload(user["id"], account_key)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
 
 
 @app.put("/api/bot/cards")
@@ -5494,12 +5451,12 @@ def save_cards(
         account_key = str(account["account_key"])
         if bot_status(user["id"], account_key).get("running"):
             raise HTTPException(409, "请先在会话工作台暂停店铺自动处理，再修改卡密库存")
-        return _save_cards_locked(body, user, account)
+        return _save_cards_locked(body, user, account, lease_key)
     finally:
         _release_account_lease(lease_key, lease_owner)
 
 
-def _save_cards_locked(body: CardsIn, user, account):
+def _save_cards_locked(body: CardsIn, user, account, lease=None):
     account_key = str(account["account_key"])
     name = str(body.name or "").strip()
     if not name:
@@ -5509,50 +5466,75 @@ def _save_cards_locked(body: CardsIn, user, account):
     note = str(body.note or "").strip()
     if len(note) > 500:
         raise HTTPException(400, "卡池备注最多 500 字")
+    if "\x00" in name + note:
+        raise HTTPException(400, "卡池名称或备注包含无效字符")
     raw_codes = body.codes
     if not isinstance(raw_codes, list) or len(raw_codes) > 20000:
         raise HTTPException(400, "码列表数量无效（最多 20000）")
-    cleaned = {}
-    for item in _read_codes(user["id"], account_key):
-        if not isinstance(item, dict):
-            continue
-        existing_code = str(item.get("code") or "").strip()
-        if existing_code:
-            cleaned[existing_code] = {
-                "code": existing_code,
-                "value": 5,
-                "used": bool(item.get("used", False)),
-            }
+    try:
+        pools, codes = fulfillment_config.read_cards(user["id"], account_key)
+        inventory = fulfillment_config._inventory_records(user["id"], account_key)
+    except FulfillmentConfigError as error:
+        raise HTTPException(error.status_code, str(error)) from error
+    if body.create and body.pool_id is not None:
+        raise HTTPException(400, "新建卡密池不能指定已有池")
+    pool = None
+    if body.pool_id is not None:
+        pool = next((entry for entry in pools if entry["id"] == body.pool_id), None)
+        if pool is None:
+            raise HTTPException(404, "卡密池不存在，请刷新后重新选择")
+    elif not body.create:
+        # Older single-pool clients may omit the ID. Once there are multiple
+        # pools, never infer a destination from its name or list position.
+        if len(pools) > 1:
+            raise HTTPException(400, "请选择要导入的卡密池")
+        pool = pools[0] if pools else None
+    if any(entry["name"] == name and entry is not pool for entry in pools):
+        raise HTTPException(409, "卡密池名称已存在，请使用不同名称")
+    if pool is None:
+        pool = {"id": "pool-" + uuid.uuid4().hex[:12], "name": name, "note": note}
+        pools.append(pool)
+    else:
+        pool.update(name=name, note=note)
+    cleaned = {entry["code"]: dict(entry) for entry in codes}
     for item in raw_codes:
         if isinstance(item, dict):
-            code = str(item.get("code") or "").strip()
-            used = bool(item.get("used", False))
+            code = item.get("code")
+            used = item.get("used", False)
         else:
-            code = str(item).strip()
+            code = item
             used = False
+        if not isinstance(code, str) or type(used) is not bool:
+            raise HTTPException(400, "卡密格式无效")
+        code = code.strip()
         if not code:
             continue
-        if len(code) > 512:
+        if len(code) > 512 or "\x00" in code:
             raise HTTPException(400, "单个兑换码最多 512 字符")
-        cleaned[code] = {"code": code, "value": 5, "used": used}
+        existing = cleaned.get(code)
+        durable = inventory.get(code)
+        if ((existing and existing["pool_id"] != pool["id"])
+                or (durable and durable["pool_id"] != pool["id"])):
+            raise HTTPException(409, "导入内容包含其他卡密池已有的卡密，请移除重复项后重试")
+        # Re-importing must not revive used codes or move them between pools.
+        cleaned[code] = {**(existing or {}), "code": code, "pool_id": pool["id"],
+                         "value": 5, "used": used or bool(existing and existing["used"])}
     codes = list(cleaned.values())
-    # An empty code list means "rename/metadata only": keep the existing
-    # inventory. Creating a new empty pool is allowed and matches the demo.
-    if not codes:
-        codes = _read_codes(user["id"], account_key)
     try:
+        _ensure_fulfillment_write(user, account, lease)
         with AccountStorage().compensating_write(
-            user["id"], account_key, ("redeem_codes.json", "card_pool.json")
+            user["id"], account_key, ("redeem_codes.json", "card_pools.json")
         ) as write:
+            write("card_pools.json", json.dumps({"version": 1, "pools": pools}, ensure_ascii=False))
             write("redeem_codes.json", json.dumps(codes, ensure_ascii=False))
-            write("card_pool.json", json.dumps({"name": name, "note": note}, ensure_ascii=False))
     except AccountStorageRecoveryError as error:
         raise HTTPException(
             503, "卡密保存失败且旧数据未能恢复，请人工核对卡池文件后再操作"
         ) from error
     except (OSError, AccountStorageError) as error:
         raise HTTPException(503, "卡密保存失败，请稍后重试") from error
-    payload = _cards_payload(codes, name=name, note=note)
+    payload = fulfillment_config.cards_payload(user["id"], account_key, pools=pools, codes=codes,
+        selected_pool_id=pool["id"], inventory=inventory)
     return {"ok": True, **payload}
 
 

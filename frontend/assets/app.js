@@ -3778,10 +3778,12 @@
     const description = String(template?.description || "").trim();
     const payload = template?.payload_set && typeof template.payload_set === "object" ? template.payload_set : {};
     if (lower === "redeem" || lower === "pan") {
+      const poolId = String(template?.card_pool_id || "redeem");
+      const pool = lower === "redeem" ? cardsPools().find((item) => String(item.id) === poolId) : null;
       return {
         delivery: lower,
         label: lower === "redeem" ? "兑换码" : "网盘资料",
-        poolName: lower === "redeem" ? String(payload.pool_name || payload.name || "").trim() : "",
+        poolName: lower === "redeem" ? (pool?.name || "原卡密池已移除，请重新绑定") : "",
         script: description,
       };
     }
@@ -3882,9 +3884,10 @@
       const used = Number(pool.used || 0);
       const reserved = Number(pool.reserved ?? Math.max(0, total - available - used));
       const enabled = pool.enabled !== false;
-      const stock = "可用 " + available + " / 总 " + total + (reserved > 0 ? " / 预占 " + reserved : "");
+      const quarantined = Number(pool.quarantined || 0);
+      const stock = "可用 " + available + " / 总 " + total + (reserved > 0 ? " / 预占 " + reserved : "") + (quarantined > 0 ? " / 不可用 " + quarantined : "");
       return '<div class="cards-row" data-cards-id="' + esc(id) + '">' +
-        '<span class="cards-row-id">' + esc(id || "--") + "</span>" +
+        '<span class="cards-row-id" title="' + esc(id) + '">' + esc(id || "--") + "</span>" +
         '<div class="cards-row-name"><strong>' + esc(pool.name || "未命名卡密池") + '</strong><small>' + esc(pool.note || "无备注") + "</small></div>" +
         '<span class="badge ' + (available > 0 ? "badge-green" : "badge-muted") + '">' + esc(stock) + "</span>" +
         '<span class="badge ' + (enabled ? "badge-green" : "badge-muted") + '">' + (enabled ? "启用" : "停用") + "</span>" +
@@ -3897,7 +3900,7 @@
 
   async function loadTemplates() {
     const context = captureAccountContext();
-    const data = await api("/api/bot/templates");
+    const [data] = await Promise.all([accountScopedApi(context, "/api/bot/templates"), loadCards({ force: true })]);
     if (!accountContextMatches(context)) return;
     state.templates = Array.isArray(data?.templates) ? data.templates : [];
     renderTemplates();
@@ -3941,7 +3944,7 @@
     try {
       const result = await accountScopedApi(context, "/api/bot/cards", {
         method: "PUT",
-        body: JSON.stringify({ name, note, codes: [] }),
+        body: JSON.stringify({ create: true, name, note, codes: [] }),
       });
       if (!accountContextMatches(context)) return;
       state.cards = result && typeof result === "object" ? result : state.cards;
@@ -3950,7 +3953,8 @@
       $("#cardsCreateNote").value = "";
       formMessage("#cardsCreateMessage", "");
       renderCards();
-      showToast("卡密池已保存");
+      renderTemplates();
+      showToast("卡密池已创建");
     } catch (error) {
       if (accountContextMatches(context)) formMessage("#cardsCreateMessage", error.message || "卡密池保存失败");
     } finally {
@@ -4000,10 +4004,15 @@
     $("#templatePriceInput").value = typeof template?.price === "number" && template.price ? String(template.price) : (template?.price || "");
     const select = $("#templateCardPoolSelect");
     const pools = cardsPools();
-    const selectedPool = deliveryInfo.delivery === "redeem" ? String(pools[0]?.name || pools[0]?.id || "") : "";
+    const selectedPool = deliveryInfo.delivery === "redeem"
+      ? String(editing ? (template.card_pool_id || "redeem") : (pools[0]?.id || ""))
+      : "";
     if (select) {
       select.innerHTML = '<option value="">无（纯话术/网盘链接）</option>' +
-        pools.map((pool) => '<option value="' + esc(String(pool.name || pool.id || "")) + '">' + esc(pool.name || "未命名卡密池") + "</option>").join("");
+        pools.map((pool) => '<option value="' + esc(String(pool.id)) + '">' + esc(pool.name || "未命名卡密池") + "（可用 " + Number(pool.available || 0) + "）</option>").join("");
+      if (selectedPool && !pools.some((pool) => String(pool.id) === selectedPool)) {
+        select.innerHTML += '<option value="' + esc(selectedPool) + '" disabled>原卡密池已移除，请重新选择</option>';
+      }
       select.value = String(selectedPool || "");
     }
     const picker = $("#templateProductPicker");
@@ -4048,10 +4057,10 @@
     const name = $("#templateNameInput").value.trim();
     const description = $("#templateDeliveryInput").value.trim();
     const price = $("#templatePriceInput").value.trim();
-    const poolName = $("#templateCardPoolSelect").value.trim();
+    const poolId = $("#templateCardPoolSelect").value.trim();
     const itemIds = reconcileTemplateItemSelection();
     const configuredDelivery = canonicalTemplateDelivery($("#templateDeliveryTypeInput")?.value || state.templateEditor?.delivery, "redeem");
-    const delivery = poolName ? "redeem" : configuredDelivery;
+    const delivery = poolId ? "redeem" : configuredDelivery;
     const template = {
       name,
       description,
@@ -4063,10 +4072,13 @@
     if (delivery === "pan") {
       const existingTags = Array.isArray(state.templateEditor?.resourceMatch) ? state.templateEditor.resourceMatch.filter(Boolean) : [];
       template.resource_match = existingTags.length ? existingTags : [name];
+    } else {
+      template.card_pool_id = poolId;
     }
     if (state.templateEditor.editingId) template.id = state.templateEditor.editingId;
-    const valid = Boolean(name) && Boolean(description);
-    return { valid, error: !name ? "请填写模板名称" : !description ? "请填写模板说明" : "", template };
+    const poolValid = delivery !== "redeem" || cardsPools().some((pool) => String(pool.id) === poolId);
+    const valid = Boolean(name) && Boolean(description) && poolValid;
+    return { valid, error: !name ? "请填写模板名称" : !description ? "请填写模板说明" : !poolValid ? "请先新建并选择要绑定的卡密池" : "", template };
   }
 
   async function saveTemplate(event) {
@@ -4124,30 +4136,50 @@
 
   function openCardsEditor(poolId = "", mode = "import") {
     const pools = cardsPools();
-    const pool = poolId ? pools.find((item) => String(item.id ?? item.key ?? "") === String(poolId)) : null;
-    state.cardsEditor = { editingId: pool ? String(pool.id ?? pool.key ?? "") : "", mode };
-    text("#cardsEditorTitle", pool ? "编辑卡密池" : "导入卡密");
-    $("#cardsPoolNameInput").value = pool?.name || "";
-    $("#cardsNoteInput").value = pool?.note || "";
+    const pool = poolId ? pools.find((item) => String(item.id) === String(poolId)) : pools.length === 1 ? pools[0] : null;
+    if (poolId && !pool) {
+      showToast("卡密池不存在，请刷新后重试", "error");
+      return;
+    }
+    state.cardsEditor = { editingId: "", mode };
+    text("#cardsEditorTitle", mode === "edit" ? "编辑卡密池" : "导入卡密");
+    const select = $("#cardsPoolSelect");
+    select.innerHTML = '<option value="__select__" disabled>请选择要导入的卡密池</option>' + pools.map((item) => '<option value="' + esc(String(item.id)) + '">' + esc(item.name) + "</option>").join("") + '<option value="">新建卡密池并导入</option>';
+    select.value = pool?.id || (pools.length ? "__select__" : "");
+    select.disabled = mode === "edit";
+    selectCardsEditorPool(select.value);
     $("#cardsCodesInput").value = "";
+    $("#cardsCodesInput").required = mode !== "edit";
+    text("#cardsCodesLabel", mode === "edit" ? "新增卡密（可留空，仅修改名称和备注）" : "卡密（每行一个）");
     formMessage("#cardsEditorMessage", "");
     const dialog = $("#cardsEditorDialog");
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
   }
 
+  function selectCardsEditorPool(poolId) {
+    const pool = cardsPools().find((item) => String(item.id) === String(poolId));
+    state.cardsEditor.poolSelected = poolId !== "__select__";
+    state.cardsEditor.editingId = pool?.id || "";
+    $("#cardsPoolNameInput").value = pool?.name || "";
+    $("#cardsNoteInput").value = pool?.note || "";
+    formMessage("#cardsEditorMessage", "");
+  }
+
   function collectCardsEditor() {
+    if (!state.cardsEditor?.poolSelected) return { valid: false, error: "请选择要导入的卡密池", payload: null };
     const name = $("#cardsPoolNameInput").value.trim();
     const note = $("#cardsNoteInput").value.trim();
     const codes = Array.from(new Set(
       String($("#cardsCodesInput").value || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
     ));
     if (!name) return { valid: false, error: "请填写卡密池名称", payload: null };
-    if (!state.cardsEditor?.editingId && !codes.length) return { valid: false, error: "请至少粘贴一个卡密", payload: null };
+    if ((state.cardsEditor?.mode !== "edit" || !state.cardsEditor?.editingId) && !codes.length) return { valid: false, error: "请至少粘贴一个卡密", payload: null };
     return {
       valid: true,
       error: "",
-      payload: { name, note, codes: codes.map((code) => ({ code })) },
+      payload: { name, note, codes: codes.map((code) => ({ code })),
+        ...(state.cardsEditor?.editingId ? { pool_id: state.cardsEditor.editingId } : { create: true }) },
     };
   }
 
@@ -4168,9 +4200,10 @@
       if (!accountContextMatches(context)) return;
       const pool = result?.pool;
       if (!pool) throw new ApiError("卡密池保存结果无效");
-      state.cards = { pool, stats: result?.stats || state.cards?.stats || null };
+      state.cards = result;
       state.cardsAccountKey = context.accountKey;
       renderCards();
+      renderTemplates();
       closeDialog("cardsEditorDialog");
       showToast(collected.payload.codes.length ? "卡密已导入并保存" : "卡密池信息已保存");
     } catch (error) {
@@ -10447,6 +10480,7 @@
     $("#importCardsButton").addEventListener("click", () => openCardsEditor());
     $("#cardsEmptyAction").addEventListener("click", () => openCardsEditor());
     $("#cardsEditorForm").addEventListener("submit", saveCards);
+    $("#cardsPoolSelect").addEventListener("change", (event) => selectCardsEditorPool(event.currentTarget.value));
     $("#cardsCreateForm").addEventListener("submit", createCardPool);
     $("#quickReplyForm")?.addEventListener("submit", addQuickReply);
     $("#manualReplyForm").addEventListener("submit", sendManualReply);

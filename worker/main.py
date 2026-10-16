@@ -499,7 +499,7 @@ def read_number_env(name, default, minimum, maximum, *, integer=False):
 from utils.xianyu_utils import generate_mid, generate_uuid, trans_cookies, generate_device_id, decrypt
 from XianyuAgent import LLMConfigurationError, LLMServiceError, XianyuReplyBot
 from context_manager import ChatContextManager, normalize_manual_reply_media, normalize_media
-from delivery_store import DeliveryStore, DeliveryStoreError
+from delivery_store import DeliveryStore, DeliveryStoreError, normalize_card_pool_id
 
 
 class ManualTakeoverError(ConnectionError):
@@ -1324,6 +1324,11 @@ class XianyuLive:
                 # but must not authorize either replies or delivery.
                 continue
             config = dict(config)
+            if config["delivery"] == "redeem":
+                try:
+                    config["card_pool_id"] = normalize_card_pool_id(config.get("card_pool_id", "redeem"))
+                except DeliveryStoreError as exc:
+                    raise RuntimeError("卡密商品必须绑定有效卡密池") from exc
             if config["delivery"] == "material":
                 material_payload = config.get("payload")
                 if material_payload is None:
@@ -2180,6 +2185,7 @@ class XianyuLive:
                 delivery_type,
                 quantity=current.quantity or 1,
                 delivery_payload=delivery_payload,
+                pool_id=item_config.get("card_pool_id", "redeem"),
             )
             if reservation.status in {"delivered", "manual_review", "cancelled", "expired"}:
                 return reservation.status
@@ -2199,6 +2205,8 @@ class XianyuLive:
                 latest_config = self.classify_item(reservation.item_id)
                 if latest_config is None or latest_config.get("delivery") != reservation.delivery_type:
                     raise OrderVerificationRejected("unsupported_item")
+                if reservation.delivery_type == "redeem" and latest_config.get("card_pool_id", "redeem") != reservation.pool_id:
+                    raise OrderVerificationRejected("card_pool_changed")
                 if reservation.delivery_type == "pan":
                     try:
                         latest_payload = self._pan_payload_for(latest_config)

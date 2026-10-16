@@ -1411,12 +1411,10 @@ def status(
     codes_total = 0
     codes_available = 0
     try:
-        codes = json.loads(read_secret(user_id, "redeem_codes.json", account_key) or "[]")
-        if isinstance(codes, list):
-            valid_codes = [item for item in codes if isinstance(item, dict) and item.get("code")]
-            codes_total = len(valid_codes)
-            codes_available = sum(1 for item in valid_codes if not item.get("used"))
-    except (TypeError, ValueError):
+        stock = FulfillmentConfig(_storage()).cards_payload(user_id, _account_key(account_key))["stats"]
+        codes_total = stock["total"]
+        codes_available = stock["available"]
+    except FulfillmentConfigError:
         pass
 
     cookie_value = read_secret(user_id, "cookies.txt", account_key)

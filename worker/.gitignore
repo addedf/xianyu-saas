@@ -5,6 +5,8 @@
 
 # 自动发货库存、发送账本与运行态目录（包含兑换信息或买家数据）
 redeem_codes.json*
+card_pool.json
+card_pools.json
 redeem_sent.json*
 trial_codes.json*
 trial_sent.json*

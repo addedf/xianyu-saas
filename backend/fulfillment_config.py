@@ -18,8 +18,9 @@ from account_storage import AccountStorageError, normalize_account_key
 from automation import AutomationValidationError, _clean_text, _safe_item_id, MAX_MATERIAL_CHARS
 
 PRODUCTS_FILE = "products_config.json"
+CARD_POOLS_FILE = "card_pools.json"
 RECEIPT_FIELD = "_ops_receipt"
-READ_FILES = frozenset({PRODUCTS_FILE, "shop_snapshot.json", "reply_rules.json", "pan_links.json", "redeem_codes.json", "card_pool.json", "delivery_state.db"})
+READ_FILES = frozenset({PRODUCTS_FILE, CARD_POOLS_FILE, "shop_snapshot.json", "reply_rules.json", "pan_links.json", "redeem_codes.json", "card_pool.json", "delivery_state.db"})
 MAX_FILE_BYTES = 32 * 1024 * 1024  # Explicit I/O protection, never a product-count quota.
 
 
@@ -27,6 +28,60 @@ class FulfillmentConfigError(ValueError):
     def __init__(self, code="invalid_arguments", message=None, status_code=400):
         self.code, self.status_code = code, status_code
         super().__init__(message or {"storage_unavailable": "配置文件不可安全读取，请在手动页面核对，未重置原文件", "revision_conflict": "配置已变化，请重新读取后操作", "clarification_required": "缺少可用资料或明确的覆盖范围，请补充说明", "invalid_arguments": "履约配置字段无效"}.get(code, "履约配置未保存"))
+
+
+def card_pool_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise FulfillmentConfigError(message="请选择有效的卡密池")
+    return value
+
+
+def card_documents(catalog, codes, legacy_meta=None):
+    """Validate the private catalog and each card's pool ownership."""
+    try:
+        if codes is not None and not isinstance(codes, list):
+            raise ValueError("invalid inventory")
+        manifest, seen = [], set()
+        for row in codes or []:
+            if (not isinstance(row, dict) or not isinstance(row.get("code"), str)
+                    or not row["code"].strip() or len(row["code"].strip()) > 512
+                    or type(row.get("used", False)) is not bool):
+                raise ValueError("invalid inventory entry")
+            secret = row["code"].strip()
+            if secret in seen:
+                raise ValueError("duplicate inventory entry")
+            seen.add(secret)
+            manifest.append({**row, "code": secret, "used": row.get("used", False),
+                             "pool_id": card_pool_id(row.get("pool_id", "redeem"))})
+        if catalog is None:
+            pools = []
+            if manifest or legacy_meta is not None:
+                if legacy_meta is not None and not isinstance(legacy_meta, dict):
+                    raise ValueError("invalid legacy pool")
+                pools = [{"id": "redeem", "name": (legacy_meta or {}).get("name", "兑换码池"),
+                          "note": (legacy_meta or {}).get("note", "")}]
+        else:
+            if not isinstance(catalog, dict) or catalog.get("version") != 1 or not isinstance(catalog.get("pools"), list):
+                raise ValueError("invalid pool catalog")
+            pools = copy.deepcopy(catalog["pools"])
+        ids, names = set(), set()
+        for pool in pools:
+            if not isinstance(pool, dict):
+                raise ValueError("invalid pool")
+            identifier = card_pool_id(pool.get("id"))
+            name, note = pool.get("name"), pool.get("note", "")
+            if (not isinstance(name, str) or not name.strip() or len(name.strip()) > 120
+                    or not isinstance(note, str) or len(note.strip()) > 500
+                    or "\x00" in name + note or identifier in ids or name.strip() in names):
+                raise ValueError("invalid pool metadata")
+            pool.update(id=identifier, name=name.strip(), note=note.strip())
+            ids.add(identifier)
+            names.add(name.strip())
+        if any(row["pool_id"] not in ids for row in manifest):
+            raise ValueError("inventory references missing pool")
+        return pools, manifest
+    except (ValueError, TypeError) as exc:
+        raise FulfillmentConfigError("storage_unavailable", status_code=503) from exc
 
 
 def json_text(value):
@@ -145,6 +200,11 @@ def products_document(value):
         if not isinstance(entry, dict) or entry.get("delivery") not in {"material", "pan", "redeem"} or type(entry.get("enabled", True)) is not bool:
             raise FulfillmentConfigError("storage_unavailable", status_code=503)
         item_ids(entry)
+        if entry["delivery"] == "redeem":
+            try:
+                card_pool_id(entry.get("card_pool_id", "redeem"))
+            except FulfillmentConfigError as exc:
+                raise FulfillmentConfigError("storage_unavailable", status_code=503) from exc
     return copy.deepcopy(value)
 
 
@@ -217,11 +277,15 @@ def normalise_template_input(raw, snapshot, preserved_item_ids=None):
         if not isinstance(tags, list) or not tags or len(tags) > 32 or any(not isinstance(tag, str) or not tag.strip() or len(tag.strip()) > 120 for tag in tags):
             raise FulfillmentConfigError(message="网盘模板必须配置有效资源匹配标签")
         result["resource_match"] = list(dict.fromkeys(tag.strip() for tag in tags))
+    else:
+        result["card_pool_id"] = card_pool_id(raw.get("card_pool_id") if raw.get("card_pool_id") is not None else "redeem")
     return result
 
 
 def template_public(item):
-    result = {key: copy.deepcopy(item[key]) for key in ("id", "name", "description", "price", "delivery", "resource_match") if key in item}
+    result = {key: copy.deepcopy(item[key]) for key in ("id", "name", "description", "price", "delivery", "resource_match", "card_pool_id") if key in item}
+    if item.get("delivery") == "redeem":
+        result["card_pool_id"] = item.get("card_pool_id", "redeem")
     result.update(item_ids=item_ids(item), enabled=item.get("enabled", True))
     result["item_count"] = len(result["item_ids"])
     if item.get("payload") or item.get("material"):
@@ -237,7 +301,10 @@ def upsert_template(document, raw, snapshot, *, new_id):
         raise FulfillmentConfigError("clarification_required")
     position = matches[0] if matches else None
     previous = result["types"][position] if position is not None else {}
-    clean = normalise_template_input(raw, snapshot, item_ids(previous))
+    template_input = dict(raw)
+    if template_input.get("card_pool_id") is None and previous.get("delivery") == "redeem":
+        template_input["card_pool_id"] = previous.get("card_pool_id", "redeem")
+    clean = normalise_template_input(template_input, snapshot, item_ids(previous))
     saved = {**previous, **clean, "id": template_id if position is not None else new_id}
     # The manual endpoint treats omission/null of these known optional fields
     # as clearing them. Preserve only unknown extensions by default here.
@@ -247,6 +314,8 @@ def upsert_template(document, raw, snapshot, *, new_id):
     saved.pop("item_id", None)
     if saved["delivery"] != "pan":
         saved.pop("resource_match", None)
+    else:
+        saved.pop("card_pool_id", None)
     targets = set(saved["item_ids"])
     if any(targets.intersection(item_ids(row)) for index, row in enumerate(result["types"]) if index != position):
         raise FulfillmentConfigError("clarification_required", "商品已绑定其他模板，请明确处理绑定冲突")
@@ -288,6 +357,8 @@ def configure_target(document, item_id, title, delivery, *, enabled, stable_id, 
     # Replacing the type does not delete unknown extensions or price metadata.
     if delivery != "pan":
         saved.pop("resource_match", None)
+    if delivery != "redeem":
+        saved.pop("card_pool_id", None)
     if delivery != "material":
         saved.pop("payload", None)
         saved.pop("material", None)
@@ -310,6 +381,8 @@ def configure_target(document, item_id, title, delivery, *, enabled, stable_id, 
     elif not resource or resource.get("delivery") != "redeem" or not resource.get("available"):
         if not (not enabled and old and old["delivery"] == "redeem"):
             raise FulfillmentConfigError("clarification_required", "当前没有可用卡密库存，请在手动页面补充库存")
+    else:
+        saved["card_pool_id"] = card_pool_id(resource.get("card_pool_id", "redeem"))
     if old:
         comparable = {**saved, "id": old.get("id")}
         original = {**old, "id": old.get("id"), "item_ids": [item_id], "enabled": old.get("enabled", True)}
@@ -339,6 +412,40 @@ class FulfillmentConfig:
 
     def read_products(self, user_id, account_key):
         return products_document(read_json(account_path(self.storage, user_id, account_key, PRODUCTS_FILE)))
+
+    def read_cards(self, user_id, account_key):
+        root_args = (self.storage, user_id, account_key)
+        catalog = read_json(account_path(*root_args, CARD_POOLS_FILE))
+        codes = read_json(account_path(*root_args, "redeem_codes.json"))
+        legacy_meta = read_json(account_path(*root_args, "card_pool.json")) if catalog is None else None
+        return card_documents(catalog, codes, legacy_meta)
+
+    def cards_payload(self, user_id, account_key, *, pools=None, codes=None, selected_pool_id=None, inventory=None):
+        if pools is None or codes is None:
+            pools, codes = self.read_cards(user_id, account_key)
+        inventory = self._inventory_records(user_id, account_key) if inventory is None else inventory
+        public = [{"id": pool["id"], "name": pool["name"], "note": pool["note"], "enabled": True,
+                   "total": 0, "available": 0, "reserved": 0, "used": 0, "quarantined": 0} for pool in pools]
+        by_id = {pool["id"]: pool for pool in public}
+        for entry in codes:
+            pool = by_id[entry["pool_id"]]
+            durable = inventory.get(entry["code"])
+            status = durable["status"] if durable else "available"
+            if durable and durable["pool_id"] != entry["pool_id"]:
+                status = "quarantined"
+            if entry["used"] and status == "available":
+                status = "legacy_used"
+            elif entry["used"] and status == "reserved":
+                status = "quarantined"
+            bucket = {"available": "available", "reserved": "reserved", "delivered": "used", "legacy_used": "used"}.get(status, "quarantined")
+            pool["total"] += 1
+            pool[bucket] += 1
+        stats = {key: sum(pool[key] for pool in public) for key in ("total", "available", "reserved", "used", "quarantined")}
+        stats["pools"] = len(public)
+        selected = next((pool for pool in public if pool["id"] == selected_pool_id), None)
+        if selected is None and len(public) == 1:
+            selected = public[0]
+        return {"pools": public, "pool": selected, "stats": stats}
 
     def write_products(self, user_id, account_key, document, *, expected_revision=None, ensure_current=None, receipt=None):
         clean = without_receipt(products_document(document))
@@ -388,31 +495,15 @@ class FulfillmentConfig:
         for tags, entries in sorted(groups.items()):
             resources.append({"key": "pan:" + digest(tags), "kind": "pan", "delivery": "pan", "name": " / ".join(entry["remark"] for entry in entries),
                               "tags": list(tags), "available": True, "count": len(entries), "version": digest(entries)})
-        codes = read_json(account_path(*root_args, "redeem_codes.json"))
-        manifest = {}
-        if codes is not None:
-            if not isinstance(codes, list):
-                raise FulfillmentConfigError("storage_unavailable", status_code=503)
-            for row in codes:
-                # Match DeliveryStore.import_inventory: redeem identity is the
-                # stripped code, not a label, payload, or card-pool display name.
-                if (not isinstance(row, dict) or not isinstance(row.get("code"), str) or not row["code"].strip()
-                        or ("used" in row and type(row["used"]) is not bool) or row["code"].strip() in manifest):
-                    raise FulfillmentConfigError("storage_unavailable", status_code=503)
-                manifest[row["code"].strip()] = row.get("used", False)
-        meta = read_json(account_path(*root_args, "card_pool.json"))
-        if meta is not None and (not isinstance(meta, dict) or not isinstance(meta.get("name", "兑换码池"), str)):
-            raise FulfillmentConfigError("storage_unavailable", status_code=503)
-        if codes is not None:
-            states = self._inventory_states(user_id, account_key)
-            # Preview the next import without performing it. New unused codes
-            # are usable even before the first redeem binding; durable used,
-            # reserved, or revoked codes can never be revived by used:false.
-            # DB-only codes were removed from the manifest and are not stock.
-            count = sum(not used and states.get(secret, "available") == "available"
-                        for secret, used in manifest.items())
-            resources.append({"key": "inventory:redeem", "kind": "inventory", "delivery": "redeem", "name": (meta or {}).get("name", "兑换码池"),
-                              "tags": [], "available": count > 0, "count": count, "version": digest([codes, states, meta])})
+        pools, codes = self.read_cards(user_id, account_key)
+        inventory = self._inventory_records(user_id, account_key)
+        stock = self.cards_payload(user_id, account_key, pools=pools, codes=codes, inventory=inventory)
+        for pool in stock["pools"]:
+            manifest = [entry for entry in codes if entry["pool_id"] == pool["id"]]
+            states = {entry["code"]: inventory.get(entry["code"]) for entry in manifest}
+            resources.append({"key": "inventory:" + pool["id"], "kind": "inventory", "delivery": "redeem", "name": pool["name"],
+                              "card_pool_id": pool["id"], "tags": [], "available": pool["available"] > 0,
+                              "count": pool["available"], "version": digest([pool, manifest, states])})
         for position, row in enumerate(products["types"]):
             delivery = row["delivery"]
             resource = {"key": f"template:{position}", "kind": "template", "delivery": delivery, "name": row.get("name", "已有发货模板"),
@@ -425,13 +516,17 @@ class FulfillmentConfig:
                 resource["available"] = bool(group)
                 resource["version"] = digest([row, group])
             else:
-                pool = next((item for item in resources if item["kind"] == "inventory"), None)
+                resource["card_pool_id"] = row.get("card_pool_id", "redeem")
+                pool = next((item for item in resources if item["kind"] == "inventory" and item["card_pool_id"] == resource["card_pool_id"]), None)
                 resource["available"] = bool(pool and pool["available"])
                 resource["version"] = digest([row, pool])
             resources.append(resource)
         return resources
 
     def _inventory_states(self, user_id, account_key):
+        return {secret: entry["status"] for secret, entry in self._inventory_records(user_id, account_key).items()}
+
+    def _inventory_records(self, user_id, account_key):
         path = account_path(self.storage, user_id, account_key, "delivery_state.db")
         if not path.exists():
             return {}
@@ -444,7 +539,10 @@ class FulfillmentConfig:
             exists = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory'").fetchone()
             if not exists:
                 return {}
-            return {row[0]: row[1] for row in con.execute("SELECT secret,status FROM inventory WHERE kind='redeem'")}
+            columns = {row[1] for row in con.execute("PRAGMA table_info(inventory)")}
+            pool_column = "pool_id" if "pool_id" in columns else "'redeem'"
+            return {row[0]: {"status": row[1], "pool_id": row[2]}
+                    for row in con.execute(f"SELECT secret,status,{pool_column} FROM inventory WHERE kind='redeem'")}
         except sqlite3.Error as exc:
             raise FulfillmentConfigError("storage_unavailable", status_code=503) from exc
         finally:

@@ -1947,7 +1947,7 @@ input:focus, textarea:focus, select:focus { border-color: var(--brand-yellow-hov
 }
 .cards-row:last-child { border-bottom: 0; }
 .cards-row:hover { background: var(--surface-soft); }
-.cards-row-id { color: var(--ink-soft); font-size: 12px; }
+.cards-row-id { color: var(--ink-soft); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cards-row-name { min-width: 0; display: grid; gap: 3px; }
 .cards-row-name strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
 .cards-row-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-soft); font-size: 11px; }

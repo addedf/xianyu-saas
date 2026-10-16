@@ -2,6 +2,7 @@ import json
 import hashlib
 import math
 import os
+import re
 import sqlite3
 import stat
 import time
@@ -13,6 +14,12 @@ from typing import Optional, Sequence
 
 class DeliveryStoreError(RuntimeError):
     pass
+
+
+def normalize_card_pool_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
+        raise DeliveryStoreError("card pool identifier is invalid")
+    return value
 
 
 @dataclass(frozen=True)
@@ -31,6 +38,7 @@ class DeliveryReservation:
     verified_at: Optional[float] = None
     platform_status: Optional[str] = None
     paid_amount: Optional[str] = None
+    pool_id: str = "redeem"
 
 
 @dataclass(frozen=True)
@@ -105,6 +113,7 @@ class DeliveryStore:
             "inventory_marked_used",
             "inventory_removed_from_manifest",
             "inventory_state_changed",
+            "card_pool_changed",
             "cancelled_during_send",
             "cancelled_after_send_attempt",
             "manual_takeover_before_send",
@@ -182,6 +191,7 @@ class DeliveryStore:
                 CREATE TABLE IF NOT EXISTS inventory (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     kind TEXT NOT NULL,
+                    pool_id TEXT NOT NULL DEFAULT 'redeem',
                     secret TEXT NOT NULL,
                     status TEXT NOT NULL,
                     reservation_key TEXT,
@@ -202,6 +212,7 @@ class DeliveryStore:
                     buyer_id TEXT,
                     item_id TEXT,
                     delivery_type TEXT,
+                    pool_id TEXT NOT NULL DEFAULT 'redeem',
                     delivery_payload TEXT,
                     quantity INTEGER NOT NULL DEFAULT 1,
                     status TEXT NOT NULL,
@@ -289,6 +300,10 @@ class DeliveryStore:
                     ON manual_reviews(status, created_at);
                 """
             )
+            inventory_columns = {row["name"] for row in conn.execute("PRAGMA table_info(inventory)")}
+            if "pool_id" not in inventory_columns:
+                conn.execute("ALTER TABLE inventory ADD COLUMN pool_id TEXT NOT NULL DEFAULT 'redeem'")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_pool_available ON inventory(kind, pool_id, status, id)")
             columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(delivery_events)")
             }
@@ -303,6 +318,7 @@ class DeliveryStore:
                 ("paid_amount", "TEXT"),
                 ("platform_shipped_at", "REAL"),
                 ("platform_ship_attempts", "INTEGER NOT NULL DEFAULT 0"),
+                ("pool_id", "TEXT NOT NULL DEFAULT 'redeem'"),
             ):
                 if column not in columns:
                     conn.execute(
@@ -420,7 +436,8 @@ class DeliveryStore:
             if secret in seen:
                 raise DeliveryStoreError(f"inventory contains duplicate entries: {Path(path).name}")
             seen.add(secret)
-            rows.append((secret, "legacy_used" if item.get("used", False) else "available"))
+            pool_id = normalize_card_pool_id(item.get("pool_id", "redeem"))
+            rows.append((secret, "legacy_used" if item.get("used", False) else "available", pool_id))
 
         now = self.now_fn()
         with self._transaction() as conn:
@@ -428,21 +445,23 @@ class DeliveryStore:
             existing = {
                 row["secret"]: row
                 for row in conn.execute(
-                    "SELECT id, secret, status FROM inventory WHERE kind = ?",
+                    "SELECT id, secret, status, pool_id FROM inventory WHERE kind = ?",
                     (kind,),
                 ).fetchall()
             }
-            for secret, status in rows:
+            for secret, status, pool_id in rows:
                 current = existing.get(secret)
                 if current is None:
                     conn.execute(
                         """
-                        INSERT INTO inventory(kind, secret, status, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?)
+                        INSERT INTO inventory(kind, secret, status, pool_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
-                        (kind, secret, status, now, now),
+                        (kind, secret, status, pool_id, now, now),
                     )
                     continue
+                if current["pool_id"] != pool_id:
+                    raise DeliveryStoreError("inventory cannot move between card pools")
                 if status == "legacy_used" and current["status"] in {
                     "available",
                     "reserved",
@@ -462,7 +481,7 @@ class DeliveryStore:
                     )
                     quarantined_inventory[current["id"]] = "inventory_marked_used"
 
-            incoming = {secret for secret, _status in rows}
+            incoming = {secret for secret, _status, _pool_id in rows}
             for secret, current in existing.items():
                 if secret in incoming or current["status"] not in {
                     "available",
@@ -1482,9 +1501,11 @@ class DeliveryStore:
         delivery_type: str,
         quantity: int = 1,
         delivery_payload: Optional[str] = None,
+        pool_id: str = "redeem",
     ) -> DeliveryReservation:
         if delivery_type not in {"redeem", "pan", "material"}:
             raise ValueError("unsupported delivery type")
+        pool_id = normalize_card_pool_id(pool_id) if delivery_type == "redeem" else "redeem"
         if isinstance(quantity, bool) or not isinstance(quantity, int):
             raise ValueError("order quantity is invalid")
         if quantity < 1 or quantity > 50:
@@ -1523,6 +1544,22 @@ class DeliveryStore:
                 if row[field] not in (None, str(value)):
                     raise DeliveryStoreError(f"payment event {field} mismatch")
             if row["status"] in {"reserved", "retry", "sending"}:
+                if delivery_type == "redeem" and row["pool_id"] != pool_id:
+                    # A retry keeps its original cards. Changing a product's
+                    # pool requires manual review instead of a second allocation.
+                    conn.execute(
+                        """UPDATE delivery_events
+                           SET status = 'manual_review', last_error = 'card_pool_changed',
+                               send_started_at = NULL, updated_at = ? WHERE order_key = ?""",
+                        (now, order_key),
+                    )
+                    conn.execute(
+                        "UPDATE inventory SET status = 'quarantined', updated_at = ? WHERE reservation_key = ? AND status = 'reserved'",
+                        (now, order_key),
+                    )
+                    self._upsert_manual_review(conn, order_key, "card_pool_changed", now)
+                    row = conn.execute("SELECT * FROM delivery_events WHERE order_key = ?", (order_key,)).fetchone()
+                    return self._reservation_from_row(conn, row)
                 if (
                     delivery_type in {"pan", "material"}
                     and row["delivery_payload"] is None
@@ -1544,21 +1581,21 @@ class DeliveryStore:
                 inventory_rows = conn.execute(
                     """
                     SELECT id FROM inventory
-                    WHERE kind = 'redeem' AND status = 'available'
+                    WHERE kind = 'redeem' AND pool_id = ? AND status = 'available'
                     ORDER BY id LIMIT ?
                     """,
-                    (quantity,),
+                    (pool_id, quantity),
                 ).fetchall()
                 if len(inventory_rows) < quantity:
                     # 库存不足整单转人工,绝不部分发送
                     conn.execute(
                         """
                         UPDATE delivery_events
-                        SET buyer_id = ?, item_id = ?, delivery_type = ?,
+                        SET buyer_id = ?, item_id = ?, delivery_type = ?, pool_id = ?,
                             status = 'manual_review', last_error = 'inventory_empty', updated_at = ?
                         WHERE order_key = ?
                         """,
-                        (str(buyer_id), str(item_id), delivery_type, now, order_key),
+                        (str(buyer_id), str(item_id), delivery_type, pool_id, now, order_key),
                     )
                     self._upsert_manual_review(
                         conn, order_key, "inventory_empty", now
@@ -1573,9 +1610,9 @@ class DeliveryStore:
                         """
                         UPDATE inventory
                         SET status = 'reserved', reservation_key = ?, buyer_id = ?, updated_at = ?
-                        WHERE id = ? AND status = 'available'
+                        WHERE id = ? AND kind = 'redeem' AND pool_id = ? AND status = 'available'
                         """,
-                        (order_key, str(buyer_id), now, inv_id),
+                        (order_key, str(buyer_id), now, inv_id, pool_id),
                     )
                     if cursor.rowcount != 1:
                         raise DeliveryStoreError("failed to reserve inventory")
@@ -1583,7 +1620,7 @@ class DeliveryStore:
             conn.execute(
                 """
                 UPDATE delivery_events
-                SET buyer_id = ?, item_id = ?, delivery_type = ?, delivery_payload = ?, quantity = ?,
+                SET buyer_id = ?, item_id = ?, delivery_type = ?, delivery_payload = ?, quantity = ?, pool_id = ?,
                     status = 'reserved', inventory_ids = ?, last_error = NULL, updated_at = ?
                 WHERE order_key = ?
                 """,
@@ -1593,6 +1630,7 @@ class DeliveryStore:
                     delivery_type,
                     delivery_payload,
                     quantity,
+                    pool_id,
                     json.dumps(inventory_ids),
                     now,
                     order_key,
@@ -1644,7 +1682,7 @@ class DeliveryStore:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT status, delivery_type, quantity, inventory_ids FROM delivery_events WHERE order_key = ?",
+                "SELECT status, delivery_type, quantity, inventory_ids, pool_id FROM delivery_events WHERE order_key = ?",
                 (str(order_key),),
             ).fetchone()
             if row is None or row["status"] != "sending":
@@ -1663,8 +1701,9 @@ class DeliveryStore:
                 FROM inventory
                 WHERE id IN ({placeholders})
                   AND status = 'reserved' AND reservation_key = ?
+                  AND kind = 'redeem' AND pool_id = ?
                 """,
-                (*inventory_ids, str(order_key)),
+                (*inventory_ids, str(order_key), row["pool_id"]),
             ).fetchone()["count"]
             return int(count) == len(inventory_ids)
         finally:
@@ -2033,4 +2072,5 @@ class DeliveryStore:
             verified_at=row["verified_at"],
             platform_status=row["platform_status"],
             paid_amount=row["paid_amount"],
+            pool_id=row["pool_id"],
         )

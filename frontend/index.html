@@ -1352,7 +1352,7 @@
         <label class="field-group"><span>模板说明</span><textarea id="templateDeliveryInput" rows="3" maxlength="500" placeholder="例如：卡密自动发货，绑定指定商品。"></textarea></label>
         <label class="field-group"><span>价格（可选）</span><input id="templatePriceInput" name="price" maxlength="40" placeholder="留空表示不限制"></label>
         <div class="field-group">
-          <span>绑定的卡密池（可选，留空则为纯话术/网盘发货）</span>
+          <span>绑定的卡密池（不同价位的商品请选择对应池）</span>
           <select id="templateCardPoolSelect" aria-label="绑定卡密池">
             <option value="">无（纯话术/网盘链接）</option>
           </select>
@@ -1377,11 +1377,12 @@
         <button type="button" class="icon-button" data-close-dialog="cardsEditorDialog" aria-label="关闭卡密编辑"><svg class="icon"><use href="/xianyu-saas/assets/icons.svg?v=20261003-01#x"></use></svg></button>
       </div>
       <div class="cards-editor-body">
+        <label class="field-group"><span>导入到卡密池</span><select id="cardsPoolSelect" aria-label="选择导入的卡密池"></select></label>
         <label class="field-group"><span>卡密池名称</span><input id="cardsPoolNameInput" name="name" maxlength="120" placeholder="例如：Python 软件卡密池" required></label>
         <label class="field-group"><span>备注说明</span><textarea id="cardsNoteInput" rows="2" maxlength="500" placeholder="例如：用于区分卡密批次或商品"></textarea></label>
-        <label class="field-group"><span>卡密（每行一个）</span><textarea id="cardsCodesInput" rows="8" maxlength="200000" placeholder="粘贴卡密，每行一个" required></textarea></label>
+        <label class="field-group"><span id="cardsCodesLabel">卡密（每行一个）</span><textarea id="cardsCodesInput" rows="8" maxlength="200000" placeholder="粘贴卡密，每行一个" required></textarea></label>
         <span id="cardsEditorMessage" class="form-message" role="alert"></span>
-        <p class="cards-editor-hint">只会导入新增且未去重的卡密，已使用过的卡密会标记为已消耗。</p>
+        <p class="cards-editor-hint">同一池内重复卡密自动去重，跨池重复会拒绝导入；已消耗的卡密不会恢复可用。</p>
       </div>
       <div class="dialog-actions">
         <button class="button button-secondary" type="button" data-close-dialog="cardsEditorDialog">取消</button>
