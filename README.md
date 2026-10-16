@@ -8,6 +8,12 @@
 
 [功能介绍](#功能介绍) · [下载安装](#安装) · [首次使用](#首次使用) · [网页更新](#网页更新) · [更多截图](#更多截图) · [开发与文档](#开发与文档) · [交流与建议](#交流与建议)
 
+## 本地二次开发
+
+本 Fork 位于 [addedf/xianyu-saas](https://github.com/addedf/xianyu-saas)，基于上游 v0.4.7，开发分支为 `codex/local-development`。
+
+本分支增加 macOS 原生后台启动入口、店铺自动处理暂停与恢复，以及按商品绑定的多个独立卡密池。首次安装、运行命令和配置步骤见 [LOCAL-RUN.md](LOCAL-RUN.md)。
+
 ![工作台概览](docs/assets/readme/overview.png)
 
 ## 功能介绍
