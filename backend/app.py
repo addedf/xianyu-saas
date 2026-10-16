@@ -5153,7 +5153,7 @@ def save_codes(
     try:
         account_key = str(account["account_key"])
         if bot_status(user["id"], account_key).get("running"):
-            raise HTTPException(409, "请先暂停自动客服，再修改卡密库存")
+            raise HTTPException(409, "请先在会话工作台暂停店铺自动处理，再修改卡密库存")
         return _save_codes_locked(body, user, account)
     finally:
         _release_account_lease(lease_key, lease_owner)
@@ -5493,7 +5493,7 @@ def save_cards(
     try:
         account_key = str(account["account_key"])
         if bot_status(user["id"], account_key).get("running"):
-            raise HTTPException(409, "请先暂停自动客服，再修改卡密库存")
+            raise HTTPException(409, "请先在会话工作台暂停店铺自动处理，再修改卡密库存")
         return _save_cards_locked(body, user, account)
     finally:
         _release_account_lease(lease_key, lease_owner)

@@ -1875,6 +1875,7 @@
     "#saveRulesDefaultsButton",
     "#rulesEnabledToggle",
     "#aiEnabledToggle",
+    "#chatAutomationStart",
     "#chatAiStart",
     "#chatAiStop",
   ];
@@ -4972,18 +4973,21 @@
   }
 
   function renderAiStatus() {
+    const workerRunning = Boolean(state.bot?.running);
     const aiEnabled = state.automation?.ai_enabled !== false;
     const aiRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules_ai" && aiEnabled);
     const rulesEnabled = state.automation?.rules_enabled !== false;
     const rulesRunning = Boolean(state.bot?.running && state.bot?.automation_mode === "rules" && rulesEnabled);
     const available = aiConnectionVerified() && aiStoreHasContent();
     const connected = shopStateView(state.bot || {}).connection === "connected";
-    text("#chatAiStatus", aiRunning ? "AI 已开启" : !aiEnabled ? "AI 已关闭" : rulesRunning ? "规则回复运行中" : available ? "AI 已就绪" : "AI 连接待配置");
-    $("#chatAiStatus").className = "badge " + (aiRunning || rulesRunning ? "badge-green" : !aiEnabled ? "badge-muted" : available ? "badge-amber" : "badge-muted");
+    text("#chatAiStatus", aiRunning ? "AI 已开启" : rulesRunning ? "规则回复运行中" : workerRunning ? "后台运行中（客服已关闭）" : connected ? "自动处理已暂停" : available ? "AI 已就绪" : "店铺未连接");
+    $("#chatAiStatus").className = "badge " + (workerRunning ? "badge-green" : !connected && available ? "badge-amber" : "badge-muted");
+    $("#chatAutomationStart").hidden = workerRunning || !connected;
+    $("#chatAutomationStart").disabled = workerRunning || !connected;
     $("#chatAiStart").hidden = aiRunning || !connected || !aiEnabled;
     $("#chatAiStart").disabled = aiRunning || !connected || !aiEnabled;
-    $("#chatAiStop").hidden = !aiRunning;
-    $("#chatAiStop").disabled = !aiRunning;
+    $("#chatAiStop").hidden = !workerRunning;
+    $("#chatAiStop").disabled = !workerRunning;
   }
 
   function productTitle(itemId) {
@@ -9840,8 +9844,8 @@
 
   function confirmStop() {
     const context = captureAccountContext();
-    text("#confirmTitle", "暂停 AI 客服");
-    text("#confirmMessage", "暂停后，AI 客服不会继续回复新的买家消息。");
+    text("#confirmTitle", "暂停店铺自动处理");
+    text("#confirmMessage", "暂停后，该店铺的自动回复和自动发货都会停止，可修改卡密库存。补货完成后需重新启动自动处理。");
     text("#confirmAction", "确认暂停");
     state.confirmAction = async () => {
       if (!accountContextMatches(context)) return;
@@ -9852,7 +9856,7 @@
         if (!accountContextMatches(context)) return;
         await refreshState();
         if (!accountContextMatches(context)) return;
-        showToast("AI 客服已暂停");
+        showToast("店铺自动处理已暂停，可修改卡密库存");
       } finally {
         if (state.automationMutationOwner === mutation) endAutomationMutation(mutation);
       }
@@ -9862,28 +9866,28 @@
     else dialog.setAttribute("open", "");
   }
 
-  async function startBot() {
-    if (!aiConnectionVerified()) {
+  async function startBot(mode = "rules_ai") {
+    if (mode === "rules_ai" && !aiConnectionVerified()) {
       showToast("请先在 AI 客服设置页测试并保存模型连接", "warning");
       showView("ai-config", true);
       return;
     }
-    if (!aiStoreHasContent()) {
+    if (mode === "rules_ai" && !aiStoreHasContent()) {
       showToast("请先填写并保存店铺说明", "warning");
       showView("ai-config", true);
       return;
     }
-    const button = $("#chatAiStart");
+    const button = $(mode === "rules" ? "#chatAutomationStart" : "#chatAiStart");
     const mutation = beginAutomationMutation("runtime");
     if (!mutation) return;
     const context = mutation.context;
     setBusy(button, true);
     try {
-      await accountScopedApi(context, "/api/bot/start", { method: "POST", body: JSON.stringify({ mode: "rules_ai" }) });
+      await accountScopedApi(context, "/api/bot/start", { method: "POST", body: JSON.stringify({ mode }) });
       if (!accountContextMatches(context)) return;
       await refreshState();
       if (!accountContextMatches(context)) return;
-      showToast("AI 客服已开启");
+      showToast(mode === "rules" ? "店铺后台已恢复" : "AI 客服已开启");
     } catch (error) {
       if (accountContextMatches(context)) showToast(error.message, "error");
     } finally {
@@ -10461,7 +10465,8 @@
     $(".chat-window").addEventListener("dragover", handleManualReplyDragOver);
     $(".chat-window").addEventListener("dragleave", handleManualReplyDragLeave);
     $(".chat-window").addEventListener("drop", handleManualReplyDrop);
-    $("#chatAiStart").addEventListener("click", startBot);
+    $("#chatAutomationStart").addEventListener("click", () => startBot("rules"));
+    $("#chatAiStart").addEventListener("click", () => startBot("rules_ai"));
     $("#chatAiStop").addEventListener("click", confirmStop);
     $("#confirmCancel").addEventListener("click", () => closeDialog("confirmDialog"));
     window.addEventListener("beforeunload", (event) => {
