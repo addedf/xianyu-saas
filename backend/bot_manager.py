@@ -16,6 +16,7 @@ import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -319,6 +320,12 @@ def _expected_worker_pid(
         return False
     if not _pid_alive(pid):
         return False
+    if sys.platform == "darwin" and os.environ.get("SAAS_ENV") == "development":
+        # A local Mac can verify its own children without Linux /proc. Never
+        # use this fallback to adopt or signal an untracked persisted PID.
+        with _lock:
+            proc = _procs.get(_proc_key(user_id, account_key))
+            return isinstance(proc, subprocess.Popen) and proc.pid == pid and proc.poll() is None
     command = _proc_cmdline(pid)
     if len(command) < 2:
         return False
@@ -681,6 +688,10 @@ def initialize_unused_account_storage(user_id: int) -> bool:
 
 
 def _limit(memory_mib=None):
+    if sys.platform == "darwin" and os.environ.get("SAAS_ENV") == "development":
+        # macOS rejects Linux-style address-space caps. Keep this exception
+        # scoped to local development; production retains the existing limit.
+        return None
     import resource
 
     # Resolve in the parent. The child only applies the captured numeric limit.
@@ -1045,7 +1056,9 @@ def _terminate_process(proc) -> tuple[bool, str]:
             return True, "already_dead"
         signal_sender = getattr(proc, "send_signal", None)
         if signal_sender is not None:
-            if not signal_sender(signal.SIGTERM):
+            # Popen.send_signal returns None after successfully signalling;
+            # adopted process handles explicitly return False on rejection.
+            if signal_sender(signal.SIGTERM) is False:
                 return False, "stop_failed"
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
@@ -1055,7 +1068,7 @@ def _terminate_process(proc) -> tuple[bool, str]:
             if not identity_matches():
                 return True, "already_dead"
             if signal_sender is not None:
-                if not signal_sender(signal.SIGKILL):
+                if signal_sender(signal.SIGKILL) is False:
                     return False, "stop_failed"
             else:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
@@ -1085,16 +1098,19 @@ def _spawn_process(user_id: int, mode: str, key: tuple[int, str], limits):
     log_file = None
     try:
         log_file = open(log_path, "a", encoding="utf-8")
+        apply_limit = _limit(limits["worker_memory_mib"])
         proc = subprocess.Popen(
             [BOT_PYTHON, BOT_MAIN],
             env=_env_for(user_id, token, mode, account_key),
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(BOT_ROOT),
-            preexec_fn=_limit(limits["worker_memory_mib"]),
+            preexec_fn=apply_limit,
             start_new_session=True,
         )
         proc._saas_resource_limits = dict(limits)
+        if apply_limit is None:
+            proc._saas_resource_limits["worker_memory_mib"] = None
     except Exception:
         _close_file(log_file)
         _revoke_token_value(user_id, account_key, token)
