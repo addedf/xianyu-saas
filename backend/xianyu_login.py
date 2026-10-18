@@ -860,6 +860,23 @@ class XianyuLoginManager:
             elif upstream_status in {"EXPIRED", "CANCELED"}:
                 next_status = "expired"
             elif upstream_status == "CONFIRMED":
+                redirect_metadata = {"host": "absent", "path": "absent", "query_keys": []}
+                redirect_url = data.get("iframeRedirectUrl")
+                if isinstance(redirect_url, str) and len(redirect_url) <= 8192:
+                    try:
+                        redirect_target = urlsplit(redirect_url)
+                        safe_path = redirect_target.path
+                        redirect_metadata = {
+                            "host": PASSPORT_HOST if redirect_target.hostname == PASSPORT_HOST else "other",
+                            "path": safe_path if re.fullmatch(r"/[A-Za-z_./-]{1,128}\.(?:htm|html|do|json)", safe_path) else "other",
+                            "query_keys": sorted(set(parse_qs(redirect_target.query, max_num_fields=32)) & {
+                                "token", "lgToken", "loginToken", "appName", "fromSite", "subFlow",
+                                "nextCode", "bizScene", "confirm", "returnUrl", "redirectUrl", "st",
+                            }),
+                        }
+                    except ValueError:
+                        redirect_metadata = {"host": "invalid", "path": "invalid", "query_keys": []}
+                LOGGER.warning("qr_login_redirect: %s", json.dumps(redirect_metadata, sort_keys=True))
                 extension = data.get("bizExt")
                 extension_format = (
                     "object" if isinstance(extension, dict) else
