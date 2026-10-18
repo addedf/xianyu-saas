@@ -2623,13 +2623,14 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "login_cooldown": 429,
         "login_capacity": 503,
         "qr_query_failed": 502,
-        "login_confirm_failed": 502,
-        "mtop_context_failed": 502,
+        "login_confirm_failed": 422,
+        "mtop_context_failed": 422,
         "qr_cookie_incomplete": 422,
         "network_error": 503,
         "platform_error": 502,
     }
     code = error.code
+    print("[qr-login-failed] code=%s" % code, file=sys.stderr, flush=True)
     detail = {"code": code, "message": error.message, "retryable": code not in {"invalid_request"}}
     headers = None
     if error.retry_after is not None:
