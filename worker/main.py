@@ -1492,6 +1492,67 @@ class XianyuLive:
         return "unsupported_sku" if sku_id is not None else "unsupported_item"
 
     @staticmethod
+    def _sku_property_pairs(values):
+        if not isinstance(values, list) or not 1 <= len(values) <= 20:
+            return None
+        pairs = []
+        for value in values:
+            if not isinstance(value, dict):
+                return None
+            name = value.get("propertyText") or value.get("name")
+            text = value.get("valueText") or value.get("actualValueText")
+            if not all(isinstance(v, str) and v.strip() and len(v) <= 160 for v in (name, text)):
+                return None
+            pairs.append((name.strip(), text.strip()))
+        if len({name for name, _ in pairs}) != len(pairs):
+            return None
+        return tuple(sorted(pairs))
+
+    async def _resolve_order_sku(self, detail, *, fatal_auth=True):
+        """Resolve full platform order properties against fresh platform SKU IDs."""
+        if detail.get("sku_id") is not None or not detail.get("sku_info"):
+            return detail
+        # Whole-item templates cannot authorize orders carrying SKU properties.
+        config = self.products.get(detail["item_id"])
+        if not config or config.get("delivery") != "sku":
+            raise OrderVerificationRejected("unsupported_sku")
+        resolved = dict(detail, sku_id=None)
+        properties = []
+        for part in detail["sku_info"].split(";"):
+            name, separator, value = part.partition(":")
+            if not separator:
+                return resolved
+            properties.append({"name": name, "valueText": value})
+        expected = self._sku_property_pairs(properties)
+        if expected is None:
+            return resolved
+        response = await self._call_xianyu_api(
+            self.xianyu.get_item_info, detail["item_id"], fatal_auth=fatal_auth
+        )
+        data = self._json_object(response.get("data")) if isinstance(response, dict) else None
+        item = self._json_object(data.get("itemDO")) if data else None
+        if not item or self._numeric_identifier(item.get("itemId")) != detail["item_id"]:
+            return resolved
+        skus = item.get("skuList")
+        if not isinstance(skus, list) or not 1 <= len(skus) <= 50:
+            return resolved
+        matches = []
+        seen = set()
+        for sku in skus:
+            if not isinstance(sku, dict):
+                return resolved
+            sku_id = self._numeric_identifier(sku.get("skuId"))
+            pairs = self._sku_property_pairs(sku.get("propertyList"))
+            if sku_id is None or sku_id in seen or pairs is None:
+                return resolved
+            seen.add(sku_id)
+            if pairs == expected:
+                matches.append(sku_id)
+        if len(matches) == 1:
+            resolved["sku_id"] = matches[0]
+        return resolved
+
+    @staticmethod
     def _json_object(value):
         for _ in range(2):
             if isinstance(value, dict):
@@ -1584,6 +1645,9 @@ class XianyuLive:
         if any(value is None for value in sku_ids) or len(set(sku_ids)) > 1:
             raise OrderVerificationRejected("sku_unavailable")
         sku_id = sku_ids[0] if sku_ids else None
+        sku_info = item_info.get("skuInfo") if item_info else None
+        if sku_info is not None and (not isinstance(sku_info, str) or len(sku_info) > 2048):
+            raise OrderVerificationRejected("sku_unavailable")
         price_info = cls._json_object(order_info.get("priceInfo")) if order_info else None
         amount = cls._json_object(price_info.get("amount")) if price_info else None
         amount_value = amount.get("value") if amount else None
@@ -1648,6 +1712,7 @@ class XianyuLive:
             "paid_amount": normalized_amount,
             "ut_status": str(ut_status).strip()[:64],
             "sku_id": sku_id,
+            "sku_info": sku_info or "",
         }
 
     @staticmethod
@@ -1799,6 +1864,7 @@ class XianyuLive:
         )
         try:
             detail = self._parse_order_detail(detail_response)
+            detail = await self._resolve_order_sku(detail)
         except OrderVerificationRejected as exc:
             self._record_unverified_manual(event, exc.reason, head["order_id"])
             return True
@@ -1971,6 +2037,7 @@ class XianyuLive:
                 self.xianyu.get_order_detail, order["order_id"], fatal_auth=False
             )
             detail = self._parse_order_detail(detail_response)
+            detail = await self._resolve_order_sku(detail, fatal_auth=False)
         except AuthenticationUnavailableError:
             # Protected auth failures carry worker-wide meaning; let the scan
             # loop stop instead of masking them as one order's local error.
@@ -2007,7 +2074,7 @@ class XianyuLive:
             ):
                 logger.warning("待发货订单会话绑定冲突 chat={}", stable_ref(chat_id))
         item_config = self.classify_item(order["item_id"], detail.get("sku_id"))
-        if existing is not None and existing.sku_id != detail.get("sku_id"):
+        if existing is not None and existing.platform_order_id is not None and existing.sku_id != detail.get("sku_id"):
             self.delivery_store.mark_order_manual_review(order_key, "order_sku_mismatch")
             return
         try:
@@ -2135,6 +2202,7 @@ class XianyuLive:
             self.xianyu.get_order_detail, reservation.platform_order_id
         )
         detail = self._parse_order_detail(response)
+        detail = await self._resolve_order_sku(detail)
         if detail["order_id"] != reservation.platform_order_id:
             raise OrderVerificationRejected("order_identity_mismatch")
         if detail["item_id"] != reservation.item_id:

@@ -1,5 +1,6 @@
 """Synthetic SKU orders: exact pools, retries, drift and platform rechecks."""
 import sqlite3
+import copy
 import time
 import unittest
 
@@ -32,6 +33,102 @@ class SkuDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
     def order(self):
         return self.agent.delivery_store.get_order(self.agent._canonical_order_key(self.api.order_id))
+
+    def configure_property_orders(self):
+        self.configure_skus()
+        self.api.order_sku_id = None
+        self.order_sku_info = "额度:5美元额度（USD）"
+        self.platform_skus = [{"skuId": str(6000 + i), "propertyList": [
+            {"propertyText": "额度", "valueText": str(amount) + "美元额度（USD）"}]
+        } for i, amount in enumerate([5, 10, 20, 50, 100])]
+        original = self.api.get_order_detail
+        def detail(order_id):
+            result = original(order_id)
+            result["data"]["components"][0]["data"]["itemInfo"]["skuInfo"] = self.order_sku_info
+            return result
+        def item(item_id):
+            self.api.item_calls += 1
+            return {"data": {"itemDO": {"itemId": item_id, "skuList": copy.deepcopy(self.platform_skus)}}}
+        self.api.get_order_detail = detail
+        self.api.get_item_info = item
+
+    async def test_real_platform_property_only_orders_use_exact_fresh_sku_for_all_five_pools(self):
+        self.configure_property_orders()
+        for i, amount in enumerate([5, 10, 20, 50, 100]):
+            self.api.order_id = self.api.head_order_id = str(6200 + i)
+            self.order_sku_info = f"额度:{amount}美元额度（USD）"
+            await self.pay()
+            self.assertEqual((self.order().status, self.order().sku_id, self.order().pool_id),
+                             ("delivered", str(6000 + i), "pool-" + str(i)))
+        self.assertGreaterEqual(self.api.item_calls, 10)
+
+    async def test_property_matching_rejects_unknown_partial_or_ambiguous_values(self):
+        self.configure_property_orders()
+        for i, value in enumerate(["5美元额度（USD）", "额度:500美元额度（USD）", "额度:5美元", "额度:"]):
+            self.api.order_id = self.api.head_order_id = str(6300 + i)
+            self.order_sku_info = value
+            await self.pay()
+            self.assertEqual(self.order().status, "manual_review")
+        self.platform_skus[1]["propertyList"] = copy.deepcopy(self.platform_skus[0]["propertyList"])
+        self.api.order_id = self.api.head_order_id = "6310"
+        self.order_sku_info = "额度:5美元额度（USD）"
+        await self.pay()
+        self.assertEqual(self.order().status, "manual_review")
+        self.agent.send_text_reliably.assert_not_awaited()
+
+    async def test_property_mapping_rechecks_fresh_sku_id_before_sending(self):
+        self.configure_property_orders()
+        original = self.api.get_item_info
+        def item(item_id):
+            if self.api.item_calls:
+                self.platform_skus[0]["skuId"] = "7000"
+            return original(item_id)
+        self.api.get_item_info = item
+        await self.pay()
+        self.assertEqual(self.order().reason, "order_sku_mismatch")
+        self.assertEqual(self.api.consign_calls, 0)
+        self.assertFalse(self.agent.delivery_store.order_inventory_is_sendable(self.order().key))
+
+    async def test_property_order_recovers_unverified_pending_notice(self):
+        self.configure_property_orders()
+        self.agent.delivery_store.record_payment_event(self.agent._canonical_order_key(ORDER_ID),
+            SESSION_ID, time.time(), 100)
+        await self.agent._reconcile_pending_order({"order_id": ORDER_ID, "item_id": API_ITEM_ID,
+            "buyer_id": BUYER_ID, "in_refund": False, "paid_amount": "5", "quantity": 1})
+        self.assertEqual((self.order().status, self.order().sku_id), ("delivered", "6000"))
+
+    async def test_all_property_dimensions_must_match_without_using_price(self):
+        self.configure_property_orders()
+        self.platform_skus[0]["propertyList"] = [
+            {"propertyText": "颜色", "valueText": "红色"}, {"propertyText": "大小", "valueText": "M"}]
+        self.order_sku_info = "大小:M;颜色:红色"
+        await self.pay()
+        self.assertEqual(self.order().sku_id, "6000")
+        self.api.order_id = self.api.head_order_id = "6400"
+        self.order_sku_info = "颜色:红色"
+        await self.pay()
+        self.assertEqual(self.order().status, "manual_review")
+        self.assertEqual(self.agent.send_text_reliably.await_count, 1)
+
+    async def test_property_order_cannot_use_a_whole_item_binding(self):
+        self.configure_property_orders()
+        write_json(self.products_path, {"types": [{"item_ids": [API_ITEM_ID], "delivery": "redeem"}]})
+        self.agent._refresh_products()
+        await self.pay()
+        self.assertEqual(self.order().reason, "unsupported_sku")
+        self.agent.send_text_reliably.assert_not_awaited()
+
+    async def test_fresh_product_identity_must_match_order_identity(self):
+        self.configure_property_orders()
+        original = self.api.get_item_info
+        def item(item_id):
+            result = original(item_id)
+            result["data"]["itemDO"]["itemId"] = "9999"
+            return result
+        self.api.get_item_info = item
+        await self.pay()
+        self.assertEqual(self.order().status, "manual_review")
+        self.agent.send_text_reliably.assert_not_awaited()
 
     async def test_all_five_skus_send_only_their_own_pool_and_are_idempotent(self):
         self.configure_skus()
