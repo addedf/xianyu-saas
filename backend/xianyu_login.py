@@ -8,11 +8,8 @@ reports a successful durable save with ``finish_consume``.
 
 from __future__ import annotations
 
-import base64
-import hashlib
 import io
 import json
-import logging
 import math
 import os
 import re
@@ -22,27 +19,21 @@ import time
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie
 from typing import Callable
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import urlsplit
 
 from account_storage import DEFAULT_ACCOUNT_ID, normalize_account_key
 from shop_sync import ShopSyncError
 
 
 PASSPORT_HOST = "passport.goofish.com"
-MINI_LOGIN_URL = "https://passport.goofish.com/mini_login.htm"
 GENERATE_URL = "https://passport.goofish.com/newlogin/qrcode/generate.do"
 QUERY_URL = "https://passport.goofish.com/newlogin/qrcode/query.do"
 LOGIN_URL = "https://passport.goofish.com/login_token/login.do"
-VERIFICATION_TTL_SECONDS = 600
-REMOTE_VERIFICATION_PATH = "/iv/remote/pc/mini_login_check.htm"
 MTOP_URL = (
     "https://h5api.m.goofish.com/h5/"
     "mtop.taobao.idlemessage.pc.loginuser.get/1.0/"
 )
-MTOP_BOOTSTRAP_API = "mtop.taobao.idlehome.home.webpc.feed"
-MTOP_BOOTSTRAP_URL = f"https://h5api.m.goofish.com/h5/{MTOP_BOOTSTRAP_API}/1.0/"
 APP_KEY = "34839810"
-LOGGER = logging.getLogger(__name__)
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_COOKIE_HEADER_BYTES = 32 * 1024
 LOGIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32,96}$")
@@ -94,11 +85,6 @@ ERROR_MESSAGES = {
     "qr_cookie_incomplete": "扫码确认成功，但登录信息不完整，请刷新二维码重试。",
     "platform_error": "闲鱼登录暂时不可用，请稍后再试。",
     "network_error": "暂时无法连接闲鱼，请稍后再试。",
-    "verification_required": "闲鱼要求安全验证，请打开官方验证页，由本人完成后继续连接。",
-    "verification_failed": "官方校验尚未建立完整登录会话，请重新扫码后再试。",
-    "verification_expired": "本次闲鱼安全验证已过期，请重新生成二维码。",
-    "verification_context_missing": "未取得本次扫码对应的安全验证会话，请重新生成二维码。",
-    "verification_browser_unavailable": "官方登录窗口暂时无法打开，请稍后重新连接。",
 }
 
 
@@ -111,12 +97,6 @@ class XianyuLoginError(RuntimeError):
         self.code = safe_code
         self.message = ERROR_MESSAGES[safe_code]
         super().__init__(self.message)
-
-
-class _VerificationNeeded(Exception):
-    def __init__(self, url: str):
-        self.url = url
-        super().__init__("verification_required")
 
 
 @dataclass
@@ -142,11 +122,6 @@ class _Login:
     session_closed: bool = False
     connection_lease: object = field(default=None, repr=False)
     lease_released: bool = False
-    login_form: dict = field(default_factory=dict, repr=False)
-    verification_url: str = field(default="", repr=False)
-    verification_started: bool = False
-    verification_callback_digest: str = field(default="", repr=False)
-    browser: object = field(default=None, repr=False)
 
 
 def _new_requests_session():
@@ -199,7 +174,7 @@ def _safe_login_id(value) -> str:
     return value
 
 
-def _response_body(response, expected_url: str) -> bytes:
+def _response_json(response, expected_url: str) -> dict:
     try:
         status_code = int(response.status_code)
         headers = response.headers
@@ -236,16 +211,7 @@ def _response_body(response, expected_url: str) -> bytes:
             if len(raw_content) + len(chunk) > MAX_RESPONSE_BYTES:
                 raise XianyuLoginError("platform_error")
             raw_content.extend(chunk)
-        return bytes(raw_content)
-    except XianyuLoginError:
-        raise
-    except Exception:
-        raise XianyuLoginError("platform_error") from None
-
-
-def _response_json(response, expected_url: str) -> dict:
-    try:
-        payload = json.loads(_response_body(response, expected_url).decode("utf-8"))
+        payload = json.loads(bytes(raw_content).decode("utf-8"))
     except XianyuLoginError:
         raise
     except Exception:
@@ -253,47 +219,6 @@ def _response_json(response, expected_url: str) -> dict:
     if not isinstance(payload, dict):
         raise XianyuLoginError("platform_error")
     return payload
-
-
-def _response_login_form(response, expected_url: str) -> dict:
-    try:
-        page = _response_body(response, expected_url).decode("utf-8")
-        marker = re.search(r"window\.viewData\s*=\s*", page)
-        if marker is None:
-            raise ValueError("missing login form")
-        view, _ = json.JSONDecoder().raw_decode(page[marker.end():])
-        form = view.get("loginFormData") if isinstance(view, dict) else None
-        if not isinstance(form, dict):
-            raise ValueError("invalid login form")
-        allowed = {
-            "_csrf_token", "appEntrance", "appName", "bizParams", "fromSite",
-            "hsiz", "isMobile", "lang", "mainPage", "returnUrl", "umidToken",
-        }
-        result = {}
-        for key in allowed:
-            value = form.get(key)
-            if value is None:
-                continue
-            if isinstance(value, bool):
-                value = "true" if value else "false"
-            elif isinstance(value, int):
-                value = str(value)
-            if (
-                not isinstance(value, str) or len(value) > 8192
-                or not value.isascii()
-                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
-            ):
-                raise ValueError("invalid login form value")
-            result[key] = value
-        if result.get("appName") != "xianyu" or result.get("fromSite") != "77":
-            raise ValueError("unexpected login application")
-        if not result.get("_csrf_token") or sum(map(len, result.values())) > 16384:
-            raise ValueError("incomplete login form")
-        return result
-    except XianyuLoginError:
-        raise
-    except Exception:
-        raise XianyuLoginError("platform_error") from None
 
 
 def _content_data(payload: dict) -> dict:
@@ -339,131 +264,21 @@ def _query_token(value) -> str:
 
 
 def _login_token(data: dict) -> str:
-    for key in ("token", "lgToken", "loginToken", "st"):
+    for key in ("token", "lgToken", "loginToken"):
         direct = data.get(key)
-        if direct not in (None, ""):
-            if key == "st":
-                if not isinstance(direct, str) or len(direct) < 8 or direct.startswith("https://"):
-                    continue
+        if direct is not None:
             return _opaque_token(direct)
-    # Current passport flows can place the one-time token in the login iframe
-    # URL instead of returning a separate token field. Never follow that URL.
-    redirect = data.get("iframeRedirectUrl")
-    if data.get("iframeRedirect") is True and isinstance(redirect, str):
-        parsed = urlsplit(redirect)
-        if len(redirect) > 8192:
-            raise XianyuLoginError("platform_error")
-        if (
-            parsed.scheme == "https" and parsed.hostname == PASSPORT_HOST
-            and parsed.path == "/login_token/login.do"
-            and parsed.username is None and parsed.password is None
-            and parsed.port in (None, 443) and not parsed.fragment
-        ):
-            tokens = parse_qs(parsed.query, max_num_fields=32).get("token", [])
-            if len(tokens) == 1:
-                return _opaque_token(tokens[0])
     extension = data.get("bizExt")
     if extension is None:
         return ""
     if isinstance(extension, str) and 2 <= len(extension) <= 8192:
         try:
-            if extension.lstrip().startswith("{"):
-                extension = json.loads(extension)
-            else:
-                decoded = base64.b64decode(
-                    extension + "=" * (-len(extension) % 4), altchars=b"-_", validate=True,
-                )
-                extension = json.loads(decoded.decode("utf-8"))
-        except (TypeError, ValueError, UnicodeError):
+            extension = json.loads(extension)
+        except (TypeError, ValueError):
             raise XianyuLoginError("platform_error") from None
     if not isinstance(extension, dict):
         raise XianyuLoginError("platform_error")
-    # Some confirmed responses complete authentication with Set-Cookie only.
-    # The final Cookie validation and authenticated profile lookup remain
-    # mandatory even when the extension contains no separate one-time token.
-    token = extension.get("loginToken")
-    return _opaque_token(token) if token not in (None, "") else ""
-
-
-def _official_verification_url(value, *, callback: bool = False) -> str:
-    if not isinstance(value, str) or not 1 <= len(value) <= 8192 or not value.isascii():
-        raise XianyuLoginError("invalid_request")
-    if any(ord(character) < 0x21 or ord(character) == 0x7F for character in value):
-        raise XianyuLoginError("invalid_request")
-    try:
-        parsed = urlsplit(value)
-        allowed_path = (
-            parsed.path == "/newlogin/safe/ivCheckLogin.htm" if callback
-            else bool(re.fullmatch(r"/iv/[A-Za-z0-9_./-]{1,180}", parsed.path))
-        )
-        if (
-            parsed.scheme != "https" or parsed.hostname != PASSPORT_HOST
-            or parsed.username is not None or parsed.password is not None
-            or parsed.port not in (None, 443) or parsed.fragment or not allowed_path
-            or "%" in parsed.path or "\\" in value
-        ):
-            raise ValueError("unexpected verification destination")
-        if any(part in {".", ".."} for part in parsed.path.split("/")):
-            raise ValueError("invalid verification path")
-        parse_qs(parsed.query, max_num_fields=32)
-    except (TypeError, ValueError):
-        raise XianyuLoginError("invalid_request") from None
-    return value
-
-
-def _verification_redirect(data: dict) -> str:
-    lowered = {str(key).lower(): value for key, value in data.items()}
-    value = lowered.get("iframeredirecturl") or lowered.get("redirecturl")
-    if not value:
-        return ""
-    try:
-        return _official_verification_url(value)
-    except XianyuLoginError:
-        return ""
-
-
-def _response_verification_navigation(response, expected_url: str) -> dict:
-    """Resolve a generic IV entry using the server's original QR Cookies."""
-    actual = urlsplit(str(getattr(response, "url", expected_url) or expected_url))
-    expected = urlsplit(expected_url)
-    if (
-        actual.scheme != "https" or actual.hostname != PASSPORT_HOST
-        or actual.path != expected.path or actual.username is not None
-        or actual.password is not None or actual.port not in (None, 443)
-    ):
-        raise XianyuLoginError("platform_error")
-    if response.status_code in {301, 302, 303, 307, 308}:
-        location = response.headers.get("Location", "")
-        if not isinstance(location, str) or not 1 <= len(location) <= 8192:
-            raise XianyuLoginError("platform_error")
-        return {"redirect": _official_verification_url(urljoin(expected_url, location))}
-    # Consume the bounded response without executing any remote JavaScript.
-    _response_body(response, expected_url)
-    return {"redirect": ""}
-
-
-def _response_verification_callback(response, expected_url: str) -> dict:
-    """The official completion endpoint returns HTML with a JSON result."""
-    try:
-        page = _response_body(response, expected_url).decode("utf-8")
-        marker = re.search(r"\bvar\s+result\s*=\s*", page)
-        if marker is None:
-            raise ValueError("missing official completion result")
-        result, _ = json.JSONDecoder().raw_decode(page[marker.end():])
-        data = result.get("data") if isinstance(result, dict) else None
-        success = isinstance(result, dict) and result.get("success") is True
-        finished = isinstance(data, dict) and data.get("processFinished") is True
-        LOGGER.warning(
-            "qr_verification_callback_result: success=%s process_finished=%s",
-            success, finished,
-        )
-        if not success or not isinstance(data, dict):
-            raise ValueError("official completion was not successful")
-        return data
-    except XianyuLoginError:
-        raise
-    except (TypeError, ValueError, UnicodeError):
-        raise XianyuLoginError("verification_context_missing") from None
+    return _opaque_token(extension.get("loginToken"))
 
 
 def _validate_svg(value) -> bytes:
@@ -526,26 +341,6 @@ def _cookie_header(session, now: float) -> str:
     if not header or len(header.encode("ascii")) > MAX_COOKIE_HEADER_BYTES:
         raise XianyuLoginError("platform_error")
     return header
-
-
-def _has_signing_cookie(session, now: float) -> bool:
-    target = urlsplit(MTOP_URL)
-    return any(
-        str(getattr(cookie, "name", "")) == "_m_h5_tk"
-        and "_" in str(getattr(cookie, "value", ""))
-        and _cookie_applies(cookie, target.hostname or "", target.path, now)
-        for cookie in session.cookies
-    )
-
-
-def _has_account_cookie(session, now: float) -> bool:
-    target = urlsplit(MTOP_URL)
-    return any(
-        str(getattr(cookie, "name", "")) == "unb"
-        and str(getattr(cookie, "value", "")).isdigit()
-        and _cookie_applies(cookie, target.hostname or "", target.path, now)
-        for cookie in session.cookies
-    )
 
 
 class XianyuLoginManager:
@@ -613,17 +408,11 @@ class XianyuLoginManager:
         item.session_closed = True
 
     def _cleanup(self, item: _Login) -> None:
-        if item.browser is not None:
-            item.browser.close()
-            item.browser = None
         item.qr_url = ""
         item.qr_svg = b""
         item.query_token = ""
         item.query_ck = ""
         item.login_token = ""
-        item.login_form.clear()
-        item.verification_url = ""
-        item.verification_callback_digest = ""
         item.cookie_header = ""
         XianyuLoginManager._close_session(item)
         if item.connection_lease is not None and not item.lease_released:
@@ -699,13 +488,6 @@ class XianyuLoginManager:
         if item.status == "error":
             code = item.error_code if item.error_code in ERROR_MESSAGES else "platform_error"
             payload.update({"code": code, "message": ERROR_MESSAGES[code]})
-        elif item.status == "verification_required":
-            payload.update({"verification_available": True, "message": ERROR_MESSAGES["verification_required"]})
-        if item.browser is not None:
-            snapshot = item.browser.snapshot()
-            payload.update({"browser_mode": True, "image_revision": snapshot["revision"]})
-            if item.status == "verification_required":
-                payload["message"] = "请按上方闲鱼官方页面提示，由本人完成安全验证。完成后会自动继续连接。"
         return payload
 
     def _renew(self, item: _Login, seconds: float) -> None:
@@ -715,10 +497,7 @@ class XianyuLoginManager:
             except Exception:
                 raise XianyuLoginError("login_expired") from None
 
-    def _call_json(
-        self, item: _Login, method: str, url: str,
-        *, response_parser: Callable = _response_json, **kwargs,
-    ) -> dict:
+    def _call_json(self, item: _Login, method: str, url: str, **kwargs) -> dict:
         with self._lock:
             now = float(self._clock())
             if self._items.get(item.login_id) is not item or now >= item.expires_at:
@@ -741,7 +520,7 @@ class XianyuLoginManager:
                     raise XianyuLoginError("login_expired")
                 self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
             response = item.session.request(method, url, **kwargs)
-            return response_parser(response, url)
+            return _response_json(response, url)
         except (XianyuLoginError, ShopSyncError):
             raise
         except Exception:
@@ -790,44 +569,9 @@ class XianyuLoginManager:
             self._last_start[scope] = now
 
         try:
-            if os.environ.get("SAAS_XIANYU_BROWSER_LOGIN", "0") == "1":
-                from xianyu_login_browser import OfficialLoginBrowser, LoginBrowserBusy
-
-                with self._lock:
-                    item.expires_at = float(self._clock()) + VERIFICATION_TTL_SECONDS
-                    self._renew(item, VERIFICATION_TTL_SECONDS + self._timeout + 10)
-                try:
-                    item.browser = OfficialLoginBrowser(
-                        VERIFICATION_TTL_SECONDS,
-                        before_open=(lambda: self._before_request_hook(item.connection_lease, 40))
-                        if self._before_request_hook is not None and item.connection_lease is not None else None,
-                        after_open=(lambda: self._after_request_hook(item.connection_lease))
-                        if self._after_request_hook is not None and item.connection_lease is not None else None,
-                    )
-                except LoginBrowserBusy:
-                    raise XianyuLoginError("login_capacity", 3) from None
-                with self._lock:
-                    item.in_flight = False
-                    if self._items.get(login_id) is not item or float(self._clock()) >= item.expires_at:
-                        self._cleanup(item)
-                        raise XianyuLoginError("login_expired")
-                    return self._public(item, float(self._clock()))
-            self._initialize_mtop(item, MTOP_BOOTSTRAP_URL, MTOP_BOOTSTRAP_API)
-            item.login_form = self._call_json(
-                item, "GET", MINI_LOGIN_URL,
-                response_parser=_response_login_form,
-                params={
-                    "lang": "zh_cn", "appName": "xianyu", "appEntrance": "web",
-                    "styleType": "vertical", "notLoadSsoView": "false",
-                    "notKeepLogin": "false", "isMobile": "false",
-                    "qrCodeFirst": "false", "stie": "77",
-                },
-                headers={"Accept": "text/html", "Referer": "https://www.goofish.com/"},
-            )
             payload = self._call_json(
                 item, "GET", GENERATE_URL,
-                params={**item.login_form, "appName": "xianyu", "appEntrance": "web", "fromSite": "77"},
-                headers={"Referer": MINI_LOGIN_URL},
+                params={"appName": "xianyu", "appEntrance": "web", "fromSite": "77"},
             )
             data = _content_data(payload)
             qr_url = _qr_url(data.get("codeContent"))
@@ -866,44 +610,13 @@ class XianyuLoginManager:
             return self._public(item, current_now)
 
     def qr_svg(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> bytes:
-        return self.qr_image(user_id, login_id, account_key)[0]
-
-    def qr_image(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> tuple[bytes, int]:
         item, _now = self._get(user_id, login_id, account_key)
         with self._lock:
             if item.status == "expired":
                 raise XianyuLoginError("login_expired")
-            if item.browser is not None:
-                snapshot = item.browser.snapshot()
-                return _validate_svg(snapshot["svg"]), snapshot["revision"]
             if not item.qr_svg:
                 raise XianyuLoginError("platform_error")
-            return bytes(item.qr_svg), 0
-
-    def _initialize_mtop(self, item: _Login, url: str, api: str) -> None:
-        self._call_json(
-            item,
-            "POST",
-            url,
-            params={
-                "jsv": "2.7.2",
-                "appKey": APP_KEY,
-                "t": str(int(time.time() * 1000)),
-                "sign": "",
-                "api": api,
-                "v": "1.0",
-                "type": "originaljson",
-                "dataType": "json",
-                "timeout": "20000",
-                "sessionOption": "AutoLoginOnly",
-            },
-            data={"data": "{}"},
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Origin": "https://www.goofish.com",
-                "Referer": "https://www.goofish.com/",
-            },
-        )
+            return bytes(item.qr_svg)
 
     def _confirm(self, item: _Login, login_token: str) -> str:
         if login_token:
@@ -928,26 +641,35 @@ class XianyuLoginManager:
                         "Referer": "https://passport.goofish.com/mini_login.htm",
                     },
                 )
-                login_data = _content_data(payload)
-                verification_url = _verification_redirect(login_data)
-                if verification_url:
-                    raise _VerificationNeeded(verification_url)
+                _content_data(payload)
             except XianyuLoginError as error:
                 if error.code in {"login_busy", "network_error"}:
                     raise
                 raise XianyuLoginError("login_confirm_failed") from None
         try:
-            self._initialize_mtop(
+            self._call_json(
                 item,
+                "POST",
                 MTOP_URL,
-                "mtop.taobao.idlemessage.pc.loginuser.get",
+                params={
+                    "jsv": "2.7.2",
+                    "appKey": APP_KEY,
+                    "t": str(int(time.time() * 1000)),
+                    "sign": "",
+                    "api": "mtop.taobao.idlemessage.pc.loginuser.get",
+                    "v": "1.0",
+                    "type": "originaljson",
+                    "dataType": "json",
+                    "timeout": "20000",
+                    "sessionOption": "AutoLoginOnly",
+                },
+                data={"data": "{}"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://www.goofish.com",
+                    "Referer": "https://www.goofish.com/",
+                },
             )
-            # The login-user endpoint may return SESSION_EXPIRED without
-            # issuing a signing Cookie on a fresh QR session. The public home
-            # endpoint initializes that short-lived Cookie; account identity
-            # and authenticated shop access are still validated on completion.
-            if not _has_signing_cookie(item.session, time.time()):
-                self._initialize_mtop(item, MTOP_BOOTSTRAP_URL, MTOP_BOOTSTRAP_API)
         except XianyuLoginError as error:
             if error.code in {"login_busy", "network_error"}:
                 raise
@@ -955,66 +677,16 @@ class XianyuLoginManager:
         try:
             return _cookie_header(item.session, time.time())
         except XianyuLoginError:
-            target = urlsplit(MTOP_URL)
-            names = {
-                str(getattr(cookie, "name", "")) for cookie in item.session.cookies
-                if _cookie_applies(cookie, target.hostname or "", target.path, time.time())
-            }
-            LOGGER.warning(
-                "qr_cookie_incomplete: unb_present=%s signing_cookie_present=%s",
-                "unb" in names, "_m_h5_tk" in names,
-            )
             raise XianyuLoginError("qr_cookie_incomplete") from None
 
-    def _prepare_verification_url(self, item: _Login, url: str) -> str:
-        url = _official_verification_url(url)
-        # This address contains no ticket. Opening it directly in a different
-        # browser uses that browser's Cookies, losing the server's QR context.
-        if urlsplit(url).path != REMOTE_VERIFICATION_PATH:
-            return url
-        seen = set()
-        for _ in range(4):
-            if url in seen:
-                raise XianyuLoginError("verification_context_missing")
-            seen.add(url)
-            navigation = self._call_json(
-                item, "GET", url, response_parser=_response_verification_navigation,
-                headers={"Accept": "text/html", "Referer": MINI_LOGIN_URL},
-            )
-            destination = navigation["redirect"]
-            target = urlsplit(destination or url)
-            expired = target.path == "/iv/static/mini_expired.htm"
-            LOGGER.warning(
-                "qr_verification_entry: redirected=%s expired=%s bound_query=%s",
-                bool(destination), expired, bool(target.query),
-            )
-            if expired:
-                raise XianyuLoginError("verification_expired")
-            if destination and target.path != REMOTE_VERIFICATION_PATH and target.query:
-                # The ticketed page can now be opened by the account owner.
-                return destination
-            if not destination:
-                if target.path == REMOTE_VERIFICATION_PATH:
-                    raise XianyuLoginError("verification_context_missing")
-                return url
-            url = destination
-        raise XianyuLoginError("verification_context_missing")
-
-    def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID, *, _verification_check=False) -> dict:
+    def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
         item, now = self._get(user_id, login_id, account_key)
-        if item.browser is not None:
-            return self._poll_browser(item, now)
         with self._lock:
-            was_verification = item.status == "verification_required"
             if item.status in {"confirmed", "expired", "error"}:
-                return self._public(item, now)
-            if was_verification and not _verification_check:
-                self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
                 return self._public(item, now)
             if item.in_flight:
                 raise XianyuLoginError("login_busy")
-            interval = 5.0 if was_verification else self._poll_interval
-            if item.last_poll_at and now - item.last_poll_at < interval:
+            if item.last_poll_at and now - item.last_poll_at < self._poll_interval:
                 return self._public(item, now)
             item.in_flight = True
             item.last_poll_at = now
@@ -1026,15 +698,13 @@ class XianyuLoginManager:
         cookie_header = ""
         error_code = ""
         temporary_error = None
-        verification_url = item.verification_url
         try:
             try:
                 payload = self._call_json(
                     item, "POST", QUERY_URL,
                     params={"appName": "xianyu", "fromSite": "77"},
-                    data={**item.login_form, "appName": "xianyu", "fromSite": "77", "appEntrance": "web",
-                          "isIframe": "true", "documentReferer": "https://www.goofish.com/",
-                          "defaultView": "qrcode", "t": query_token, "ck": query_ck},
+                    data={"appName": "xianyu", "fromSite": "77", "appEntrance": "web",
+                          "t": query_token, "ck": query_ck},
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Origin": "https://passport.goofish.com",
@@ -1051,74 +721,20 @@ class XianyuLoginManager:
                 raise XianyuLoginError("qr_query_failed")
             upstream_status = upstream_status.upper()
             if upstream_status == "NEW":
-                next_status = "verification_required" if was_verification else "waiting"
+                next_status = "waiting"
             elif upstream_status in {"SCANED", "SCANNED"}:
-                next_status = "verification_required" if was_verification else "scanned"
+                next_status = "scanned"
             elif upstream_status in {"EXPIRED", "CANCELED"}:
-                next_status = "verification_required" if was_verification else "expired"
+                next_status = "expired"
             elif upstream_status == "CONFIRMED":
-                returned_verification = _verification_redirect(data)
-                if returned_verification:
-                    verification_url = returned_verification
-                    try:
-                        login_token = _login_token(data)
-                    except XianyuLoginError:
-                        login_token = ""
-                    raise _VerificationNeeded(verification_url)
-                redirect_metadata = {"host": "absent", "path": "absent", "query_keys": []}
-                redirect_url = data.get("iframeRedirectUrl")
-                if isinstance(redirect_url, str) and len(redirect_url) <= 8192:
-                    try:
-                        redirect_target = urlsplit(redirect_url)
-                        safe_path = redirect_target.path
-                        redirect_metadata = {
-                            "host": PASSPORT_HOST if redirect_target.hostname == PASSPORT_HOST else "other",
-                            "path": safe_path if re.fullmatch(r"/[A-Za-z_./-]{1,128}\.(?:htm|html|do|json)", safe_path) else "other",
-                            "query_keys": sorted(set(parse_qs(redirect_target.query, max_num_fields=32)) & {
-                                "token", "lgToken", "loginToken", "appName", "fromSite", "subFlow",
-                                "nextCode", "bizScene", "confirm", "returnUrl", "redirectUrl", "st",
-                            }),
-                        }
-                    except ValueError:
-                        redirect_metadata = {"host": "invalid", "path": "invalid", "query_keys": []}
-                LOGGER.warning("qr_login_redirect: %s", json.dumps(redirect_metadata, sort_keys=True))
-                extension = data.get("bizExt")
-                extension_format = (
-                    "object" if isinstance(extension, dict) else
-                    "json" if isinstance(extension, str) and extension.lstrip().startswith("{") else
-                    "encoded" if isinstance(extension, str) else "absent"
-                )
-                LOGGER.warning(
-                    "qr_confirmation_shape: biz_ext_format=%s direct_token_present=%s iframe_redirect=%s",
-                    extension_format,
-                    any(data.get(key) not in (None, "") for key in ("token", "lgToken", "loginToken")),
-                    data.get("iframeRedirect") is True,
-                )
                 try:
                     login_token = _login_token(data)
                 except XianyuLoginError:
                     raise XianyuLoginError("login_confirm_failed") from None
-                LOGGER.warning(
-                    "qr_confirmed_context: token_present=%s iframe_redirect=%s async_urls_present=%s",
-                    bool(login_token), data.get("iframeRedirect") is True,
-                    bool(data.get("asyncUrls")),
-                )
-                if was_verification and not login_token and not _has_account_cookie(item.session, time.time()):
-                    next_status = "verification_required"
-                else:
-                    cookie_header = self._confirm(item, login_token)
-                    next_status = "confirmed"
+                cookie_header = self._confirm(item, login_token)
+                next_status = "confirmed"
             else:
                 raise XianyuLoginError("qr_query_failed")
-        except _VerificationNeeded as exc:
-            verification_url = exc.url
-            next_status = "verification_required"
-            try:
-                verification_url = self._prepare_verification_url(item, verification_url)
-            except ShopSyncError as error:
-                temporary_error = error
-            except XianyuLoginError as error:
-                error_code = error.code
         except ShopSyncError as exc:
             temporary_error = exc
         except XianyuLoginError as exc:
@@ -1137,7 +753,7 @@ class XianyuLoginManager:
                 self._expire(item, current_now)
                 return self._public(item, current_now)
             item.in_flight = False
-            item.login_token = (login_token or item.login_token) if next_status == "verification_required" else ""
+            item.login_token = ""
             if temporary_error is not None:
                 raise temporary_error
             if error_code in {"login_busy", "network_error"}:
@@ -1154,13 +770,6 @@ class XianyuLoginManager:
                 return payload
             item.status = next_status
             item.error_code = ""
-            if next_status == "verification_required":
-                if not item.verification_started:
-                    item.expires_at = current_now + VERIFICATION_TTL_SECONDS
-                    item.verification_started = True
-                item.verification_url = verification_url
-                self._renew(item, max(1, item.expires_at - current_now) + self._timeout + 10)
-                LOGGER.warning("qr_login_verification_required")
             if next_status == "confirmed":
                 try:
                     self._renew(item, self._confirmed_ttl + self._timeout + 10)
@@ -1171,228 +780,9 @@ class XianyuLoginManager:
                 item.expires_at = current_now + self._confirmed_ttl
                 item.query_token = ""
                 item.query_ck = ""
-                item.login_form.clear()
                 item.qr_url = ""
                 item.qr_svg = b""
                 self._close_session(item)
-            return self._public(item, current_now)
-
-    def _poll_browser(self, item: _Login, now: float) -> dict:
-        with self._lock:
-            if self._items.get(item.login_id) is not item:
-                self._cleanup(item)
-                raise XianyuLoginError("login_not_found")
-            if item.status in {"confirmed", "expired", "error"}:
-                return self._public(item, now)
-            if item.in_flight:
-                raise XianyuLoginError("login_busy")
-            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
-            snapshot = item.browser.snapshot(credentials=True)
-            if snapshot["status"] == "error":
-                item.status = "error"
-                item.error_code = "verification_browser_unavailable"
-                result = self._public(item, now)
-                self._cleanup(item)
-                self._items.pop(item.login_id, None)
-                self._by_user.pop((item.user_id, item.account_key), None)
-                return result
-            if snapshot["status"] == "expired":
-                self._expire(item, now)
-                return self._public(item, now)
-            if snapshot["status"] != "confirmed":
-                item.status = snapshot["status"]
-                return self._public(item, now)
-            if item.last_poll_at and now - item.last_poll_at < 5:
-                return self._public(item, now)
-            item.in_flight = True
-            item.last_poll_at = now
-        try:
-            # Preserve browser cookie scope, expiry and flags. Never promote
-            # passport-only cookies to another host or accept a pasted URL.
-            if len(snapshot["cookies"]) > 256:
-                raise XianyuLoginError("platform_error")
-            for cookie in snapshot["cookies"]:
-                domain = str(cookie.get("domain") or "")
-                if domain.lstrip(".") != "goofish.com" and not domain.lstrip(".").endswith(".goofish.com"):
-                    continue
-                name, value = str(cookie.get("name") or ""), str(cookie.get("value") or "")
-                if not COOKIE_NAME_RE.fullmatch(name) or len(value) > 4096:
-                    continue
-                expiry = cookie.get("expires")
-                rest = {"HttpOnly": None} if cookie.get("httpOnly") else {}
-                if cookie.get("sameSite") in {"Lax", "Strict", "None"}:
-                    rest["SameSite"] = cookie["sameSite"]
-                imported = Cookie(
-                    version=0, name=name, value=value, port=None, port_specified=False,
-                    domain=domain, domain_specified=domain.startswith("."), domain_initial_dot=domain.startswith("."),
-                    path=str(cookie.get("path") or "/"), path_specified=True, secure=bool(cookie.get("secure")),
-                    expires=int(expiry) if expiry and expiry > 0 else None, discard=not bool(expiry and expiry > 0),
-                    comment=None, comment_url=None, rest=rest, rfc2109=False,
-                )
-                item.session.cookies.set_cookie(imported)
-            if snapshot["user_agent"]:
-                item.session.headers["User-Agent"] = snapshot["user_agent"]
-            header = self._confirm(item, "")
-        except (XianyuLoginError, ShopSyncError):
-            # Keep the human's completed browser session while a bounded
-            # platform initialization or egress lease is temporarily busy.
-            with self._lock:
-                item.in_flight = False
-                if self._items.get(item.login_id) is not item or float(self._clock()) >= item.expires_at:
-                    self._cleanup(item)
-            raise
-        except Exception:
-            with self._lock:
-                item.in_flight = False
-                if self._items.get(item.login_id) is not item or float(self._clock()) >= item.expires_at:
-                    self._cleanup(item)
-            raise XianyuLoginError("platform_error") from None
-        with self._lock:
-            item.in_flight = False
-            current_now = float(self._clock())
-            if self._items.get(item.login_id) is not item or current_now >= item.expires_at:
-                self._expire(item, current_now)
-                raise XianyuLoginError("login_expired")
-            try:
-                self._renew(item, self._confirmed_ttl + self._timeout + 10)
-            except XianyuLoginError:
-                self._expire(item, current_now)
-                raise
-            item.status = "confirmed"
-            item.cookie_header = header
-            item.expires_at = current_now + self._confirmed_ttl
-            item.browser.close()
-            item.browser = None
-            self._close_session(item)
-            LOGGER.warning("qr_official_browser_confirmed")
-            return self._public(item, current_now)
-
-    def browser_action(self, user_id, login_id, revision, points, account_key=DEFAULT_ACCOUNT_ID) -> dict:
-        item, now = self._get(user_id, login_id, account_key)
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
-            raise XianyuLoginError("invalid_request")
-        if not isinstance(points, list) or not 1 <= len(points) <= 80:
-            raise XianyuLoginError("invalid_request")
-        normalized = []
-        for point in points:
-            if not isinstance(point, (tuple, list)) or len(point) != 2:
-                raise XianyuLoginError("invalid_request")
-            if any(isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 1 for value in point):
-                raise XianyuLoginError("invalid_request")
-            normalized.append((float(point[0]), float(point[1])))
-        with self._lock:
-            if item.status not in {"waiting", "scanned", "verification_required"} or item.browser is None:
-                raise XianyuLoginError("login_not_confirmed")
-            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
-            from xianyu_login_browser import LoginBrowserBusy
-            try:
-                item.browser.action(revision, normalized)
-            except LoginBrowserBusy:
-                raise XianyuLoginError("login_busy", 1) from None
-            return {"accepted": True}
-
-    def verification_url(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> str:
-        item, now = self._get(user_id, login_id, account_key)
-        with self._lock:
-            if item.status != "verification_required" or not item.verification_url:
-                raise XianyuLoginError("login_not_confirmed")
-            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
-            return _official_verification_url(item.verification_url)
-
-    def check_verification(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
-        item, now = self._get(user_id, login_id, account_key)
-        with self._lock:
-            if item.status not in {"verification_required", "confirmed"}:
-                raise XianyuLoginError("login_expired")
-        return self.poll(user_id, login_id, account_key, _verification_check=True)
-
-    def finish_verification(self, user_id, login_id, callback_url, account_key=DEFAULT_ACCOUNT_ID) -> dict:
-        callback_url = _official_verification_url(callback_url, callback=True)
-        query = parse_qs(urlsplit(callback_url).query, max_num_fields=32)
-        values = query.get("havana_iv_token") or query.get("havanaIvToken") or []
-        if len(values) != 1:
-            raise XianyuLoginError("invalid_request")
-        _opaque_token(values[0])
-        for name in ("havana_iv_token", "havanaIvToken", "ck", "sg", "cdt", "scene", "lang", "rf", "appName", "appEntrance"):
-            if len(query.get(name, [])) > 1:
-                raise XianyuLoginError("invalid_request")
-        item, now = self._get(user_id, login_id, account_key)
-        digest = hashlib.sha256(callback_url.encode("ascii")).hexdigest()
-        with self._lock:
-            if item.browser is not None:
-                raise XianyuLoginError("invalid_request")
-            if item.status == "confirmed":
-                return self._public(item, now)
-            if item.status != "verification_required":
-                raise XianyuLoginError("login_expired")
-            if item.in_flight or item.consuming:
-                raise XianyuLoginError("login_busy")
-            if item.verification_callback_digest == digest:
-                raise XianyuLoginError("verification_failed")
-            item.verification_callback_digest = digest
-            item.in_flight = True
-        header = ""
-        failed = False
-        failure_code = "verification_failed"
-        temporary_error = None
-        next_verification = ""
-        try:
-            # The completion page itself establishes the official session via
-            # Set-Cookie. A separate login.do POST loses this navigation step.
-            LOGGER.warning(
-                "qr_verification_callback_context: ck_matches_qr=%s",
-                query.get("ck", [""])[0] == item.query_ck,
-            )
-            data = self._call_json(
-                item, "GET", callback_url, response_parser=_response_verification_callback,
-                headers={"Accept": "text/html", "Referer": MINI_LOGIN_URL},
-            )
-            next_verification = _verification_redirect(data)
-            if not next_verification:
-                header = self._confirm(item, _login_token(data))
-        except _VerificationNeeded as exc:
-            next_verification = exc.url
-        except ShopSyncError as error:
-            temporary_error = error
-        except XianyuLoginError as error:
-            if error.code in {"login_busy", "network_error"}:
-                temporary_error = error
-            else:
-                failure_code = error.code if error.code.startswith("verification_") else "verification_failed"
-                failed = True
-        except Exception:
-            failed = True
-        with self._lock:
-            current_now = float(self._clock())
-            item.in_flight = False
-            if self._items.get(item.login_id) is not item or current_now >= item.expires_at:
-                self._expire(item, current_now)
-                raise XianyuLoginError("login_expired")
-            if temporary_error is not None:
-                raise temporary_error
-            if next_verification:
-                item.verification_url = next_verification
-                return self._public(item, current_now)
-            if failed or not header:
-                item.status = "error"
-                item.error_code = failure_code
-                result = self._public(item, current_now)
-                self._by_user.pop((item.user_id, item.account_key), None)
-                self._items.pop(item.login_id, None)
-                self._cleanup(item)
-                LOGGER.warning("qr_verification_exchange_failed: code=%s", failure_code)
-                return result
-            self._renew(item, self._confirmed_ttl + self._timeout + 10)
-            item.status = "confirmed"
-            item.cookie_header = header
-            item.expires_at = current_now + self._confirmed_ttl
-            item.query_token = ""
-            item.query_ck = ""
-            item.login_token = ""
-            item.login_form.clear()
-            item.verification_url = ""
-            self._close_session(item)
-            LOGGER.warning("qr_verification_exchange_confirmed")
             return self._public(item, current_now)
 
     def begin_consume(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> str:

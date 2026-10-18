@@ -67,9 +67,6 @@ ENV TZ=Asia/Shanghai \
     SAAS_DB=/data/saas.db \
     SAAS_TENANTS_DIR=/data/tenants
 
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright \
-    SAAS_XIANYU_BROWSER_LOGIN=1
-
 # nodejs 用于静态工作台服务；util-linux 提供 setsid，procps 供进程身份校验。
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -84,10 +81,6 @@ WORKDIR /app
 
 COPY --from=builder /opt/backend-venv /app/backend/.venv
 COPY --from=builder /opt/worker-venv /app/worker/.venv
-
-# 官方扫码及人脸验证共用一个临时浏览器；运行时不下载，非 root 可读取。
-RUN /app/backend/.venv/bin/python -m playwright install --with-deps --no-shell chromium \
-    && chmod -R a+rX /opt/playwright
 
 COPY backend/ /app/backend/
 COPY worker/ /app/worker/

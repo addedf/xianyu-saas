@@ -283,8 +283,6 @@ def _request_body_limit(path: str) -> int:
         return AUTH_REQUEST_BODY_LIMIT
     if path == "/api/admin/confirm" or path.startswith("/api/admin/updates/"):
         return SENSITIVE_REQUEST_BODY_LIMIT
-    if path.startswith("/api/bot/login/") and path.endswith("/browser/action"):
-        return 8 * 1024
     if path in {"/api/bot/login/start", "/api/bot/login/complete"} or path.startswith("/api/bot/login/"):
         return SHOP_LOGIN_REQUEST_BODY_LIMIT
     return DEFAULT_REQUEST_BODY_LIMIT
@@ -1502,21 +1500,6 @@ class XianyuLoginCompleteIn(BaseModel):
         extra = "forbid"
 
 
-class XianyuVerificationCompleteIn(BaseModel):
-    callback_url: str = Field(default="", max_length=8192)
-
-    class Config:
-        extra = "forbid"
-
-
-class XianyuLoginBrowserActionIn(BaseModel):
-    revision: int = Field(ge=0)
-    points: list[tuple[float, float]] = Field(min_length=1, max_length=80)
-
-    class Config:
-        extra = "forbid"
-
-
 class CodesIn(BaseModel):
     codes: list
 
@@ -2640,19 +2623,13 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "login_cooldown": 429,
         "login_capacity": 503,
         "qr_query_failed": 502,
-        "login_confirm_failed": 422,
-        "mtop_context_failed": 422,
+        "login_confirm_failed": 502,
+        "mtop_context_failed": 502,
         "qr_cookie_incomplete": 422,
-        "verification_required": 409,
-        "verification_failed": 422,
-        "verification_expired": 410,
-        "verification_context_missing": 422,
-        "verification_browser_unavailable": 503,
         "network_error": 503,
         "platform_error": 502,
     }
     code = error.code
-    print("[qr-login-failed] code=%s" % code, file=sys.stderr, flush=True)
     detail = {"code": code, "message": error.message, "retryable": code not in {"invalid_request"}}
     headers = None
     if error.retry_after is not None:
@@ -4918,10 +4895,10 @@ def xianyu_login_qr(
     _require_permission(user, "shop.configure")
     account_key = str(account["account_key"])
     try:
-        svg, revision = (
-            qr_logins.qr_image(user["id"], login_id)
+        svg = (
+            qr_logins.qr_svg(user["id"], login_id)
             if account_key == "default"
-            else qr_logins.qr_image(user["id"], login_id, account_key)
+            else qr_logins.qr_svg(user["id"], login_id, account_key)
         )
     except XianyuLoginError as error:
         raise _xianyu_login_http_error(error) from None
@@ -4931,26 +4908,9 @@ def xianyu_login_qr(
         headers={
             "Cache-Control": "no-store",
             "Content-Disposition": 'inline; filename="xianyu-login.svg"',
-            "Content-Security-Policy": "default-src 'none'; img-src data:",
-            "X-Login-Image-Revision": str(revision),
+            "Content-Security-Policy": "default-src 'none'",
         },
     )
-
-
-@app.post("/api/bot/login/{login_id}/browser/action")
-def xianyu_login_browser_action(
-    login_id: str,
-    body: XianyuLoginBrowserActionIn,
-    user=Depends(Auth.current_user),
-    account=Depends(current_shop_account),
-):
-    _require_permission(user, "shop.configure")
-    try:
-        return qr_logins.browser_action(
-            user["id"], login_id, body.revision, body.points, str(account["account_key"]),
-        )
-    except XianyuLoginError as error:
-        raise _xianyu_login_http_error(error) from None
 
 
 @app.get("/api/bot/login/{login_id}/status")
@@ -4969,49 +4929,6 @@ def xianyu_login_status(
         )
         if result.get("status") == "error":
             raise XianyuLoginError(str(result.get("code") or "platform_error"))
-        return result
-    except ShopSyncError as error:
-        raise _shop_sync_http_error(error) from None
-    except XianyuLoginError as error:
-        raise _xianyu_login_http_error(error) from None
-
-
-@app.get("/api/bot/login/{login_id}/verification")
-def open_xianyu_verification(
-    login_id: str,
-    account_key: str = Query(default="default", min_length=1, max_length=80),
-    user=Depends(Auth.current_user),
-):
-    _require_permission(user, "shop.configure")
-    account = db.get_shop_account(user["id"], account_key=account_key)
-    if account is None or not account["enabled"]:
-        raise HTTPException(404, "店铺账号不存在或已停用")
-    try:
-        url = qr_logins.verification_url(user["id"], login_id, account_key)
-    except XianyuLoginError as error:
-        raise _xianyu_login_http_error(error) from None
-    return RedirectResponse(url, status_code=303, headers={
-        "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
-    })
-
-
-@app.post("/api/bot/login/{login_id}/verification/complete")
-def complete_xianyu_verification(
-    login_id: str,
-    body: XianyuVerificationCompleteIn,
-    user=Depends(Auth.current_user),
-    account=Depends(current_shop_account),
-):
-    _require_permission(user, "shop.configure")
-    try:
-        if body.callback_url:
-            result = qr_logins.finish_verification(
-                user["id"], login_id, body.callback_url, str(account["account_key"]),
-            )
-        else:
-            result = qr_logins.check_verification(user["id"], login_id, str(account["account_key"]))
-        if result.get("status") == "error":
-            raise XianyuLoginError(str(result.get("code") or "verification_failed"))
         return result
     except ShopSyncError as error:
         raise _shop_sync_http_error(error) from None
