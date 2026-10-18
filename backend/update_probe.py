@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import secrets
 import threading
@@ -38,6 +39,11 @@ _SEMVER = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 logger = logging.getLogger(__name__)
+
+
+def self_update_enabled():
+    """Allow operators to disable upstream discovery and every web update action."""
+    return os.environ.get("SAAS_SELF_UPDATE_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class ProbeError(RuntimeError):
@@ -191,6 +197,8 @@ class ProbeCoordinator:
         return _positive_seconds(self.clock(), "probe clock", minimum=0.0)
 
     def _paused(self):
+        if not self_update_enabled():
+            return True
         try:
             return bool(self.is_paused())
         except Exception:
@@ -200,6 +208,21 @@ class ProbeCoordinator:
     def snapshot(self):
         """Return only local cache/metadata, reprojected against the running version."""
         now, version = self._now(), self._version()
+        if not self_update_enabled():
+            return {
+                "channel": self.channel, "current_version": version,
+                "status": "disabled", "disabled": True, "available": False,
+                "checked_at": None, "version": "", "published_at": "",
+                "release_notes": "", "error_code": "",
+                "update_probe": {
+                    "state": "disabled", "disabled": True, "checking": False,
+                    "paused": True, "has_success": False, "cache_stale": False,
+                    "last_attempt_at": None, "last_success_at": None, "last_failure_at": None,
+                    "next_check_at": 0, "interval_seconds": self.interval_seconds,
+                    "consecutive_failures": 0, "error_code": "",
+                    "retry_not_before": 0, "manual_cooldown_until": 0, "retry_after": 0,
+                },
+            }
         state = self.db.get_platform_update_probe(
             self.channel, interval_seconds=self.interval_seconds,
         )
@@ -362,6 +385,8 @@ class ProbeCoordinator:
 
     def start(self):
         """Start an asynchronous initial/due check without delaying service readiness."""
+        if not self_update_enabled():
+            return
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 if self._closing:

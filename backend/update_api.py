@@ -10,6 +10,7 @@ import time
 
 import platform_update as protocol
 from update_maintenance import maintenance_active
+from update_probe import self_update_enabled
 from update_progress import observe_preparation
 
 
@@ -89,6 +90,12 @@ class UpdateAPI:
 
     def capabilities(self, check=None):
         result = self.backend.update_capabilities()
+        if not self_update_enabled():
+            return {
+                **result, "enabled": False, "check": False, "download": False,
+                "apply": False, "rollback": False, "reason": "update_installation_unsupported",
+                "instruction": "此部署已禁用网页自更新，请由维护者通过自己的仓库构建并发布。",
+            }
         mode = result.get("deployment")
         assets = (check or {}).get("installer_assets")
         if isinstance(assets, dict) and assets.get(mode) is False and result.get("download"):
@@ -98,7 +105,13 @@ class UpdateAPI:
                 result["apply"] = False
         return result
 
+    @staticmethod
+    def _require_enabled():
+        if not self_update_enabled():
+            raise protocol.PlatformUpdateError("update_installation_unsupported")
+
     def _require_available(self, action, *, operation_id=""):
+        self._require_enabled()
         if self.is_paused():
             raise protocol.PlatformUpdateError("update_maintenance_active")
         result = self.backend.update_capabilities()
@@ -147,6 +160,7 @@ class UpdateAPI:
         return None
 
     def prepare(self, version, action, user_id, session, *, ensure_owned=lambda: None):
+        self._require_enabled()
         session_digest = self._session(user_id, session)
         if action not in {"apply", "rollback"}:
             raise protocol.PlatformUpdateError("update_operation_invalid")
@@ -218,6 +232,7 @@ class UpdateAPI:
         return self.public_operation(row)
 
     def confirm(self, operation_id, version, action, user_id, session):
+        self._require_enabled()
         row = self._record(operation_id, version, action, user_id, session)
         self._require_available(action, operation_id=operation_id)
         if row["status"] != "staged":
@@ -234,6 +249,7 @@ class UpdateAPI:
                 "version": version, "manifest_sha256": row["manifest_sha256"]}
 
     def submit(self, operation_id, version, action, token, user_id, session, *, ensure_owned=lambda: None):
+        self._require_enabled()
         row = self._record(operation_id, version, action, user_id, session)
         self.reconcile(operation_id)
         row = dict(self.db.get_update_operation(operation_id))
@@ -273,6 +289,7 @@ class UpdateAPI:
         return self.public_operation(self.db.active_update_operation() or self.db.latest_update_operation())
 
     def _publish(self, row):
+        self._require_enabled()
         if row.get("requested_at") is None or not row.get("confirmation_digest"):
             raise protocol.PlatformUpdateError("confirmation_invalid")
         with self._publish_lock:
@@ -310,6 +327,8 @@ class UpdateAPI:
                 raise
 
     def recover_pending(self):
+        if not self_update_enabled():
+            return
         self.reconcile()
         for row in self.db.list_update_operations(pending_only=True):
             if row["status"] != "staged" and not row["published_at"]:
@@ -327,6 +346,8 @@ class UpdateAPI:
             self._stop.wait(3.0)
 
     def start(self):
+        if not self_update_enabled():
+            return
         with self._lifecycle_lock:
             if self._thread is not None and self._thread.is_alive():
                 return

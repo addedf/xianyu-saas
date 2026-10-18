@@ -42,8 +42,8 @@ export SAAS_LAUNCH_PYTHON="$app_root/backend/.venv/bin/python"
 export SAAS_LAUNCH_WORKER_PYTHON="$app_root/worker/.venv/bin/python"
 export SAAS_LAUNCH_API_PORT="$api_port"
 export SAAS_LAUNCH_WEB_PORT="$web_port"
-export SAAS_LAUNCH_WEB=1
-export SAAS_LAUNCH_CONSUMER=1
+export SAAS_LAUNCH_WEB="${SAAS_LAUNCH_WEB:-1}"
+export SAAS_LAUNCH_CONSUMER="${SAAS_LAUNCH_CONSUMER:-1}"
 
 printf '[entrypoint] launcher: 工作台 :%s，API :%s，代码存储 %s\n' "$web_port" "$api_port" "$SAAS_APP_CODE_DIR"
 exec "$app_root/docker/launcher.sh"
