@@ -105,6 +105,7 @@ import records
 from shop_sync import (
     CANONICAL_STATUS_CODES,
     ShopSyncError,
+    account_ref,
     clear_connection as clear_shop_connection,
     load_verified_snapshot,
     parse_cookie_header,
@@ -283,6 +284,8 @@ def _request_body_limit(path: str) -> int:
         return AUTH_REQUEST_BODY_LIMIT
     if path == "/api/admin/confirm" or path.startswith("/api/admin/updates/"):
         return SENSITIVE_REQUEST_BODY_LIMIT
+    if path == "/api/bot/cookies":
+        return 40 * 1024
     if path in {"/api/bot/login/start", "/api/bot/login/complete"} or path.startswith("/api/bot/login/"):
         return SHOP_LOGIN_REQUEST_BODY_LIMIT
     return DEFAULT_REQUEST_BODY_LIMIT
@@ -1491,6 +1494,8 @@ class AIReadyIn(BaseModel):
 
 class CookiesIn(BaseModel):
     cookies: str
+    expected_account_ref: str | None = Field(default=None, pattern=r"^[a-f0-9]{16}$")
+    resume: bool = False
 
 
 class XianyuLoginCompleteIn(BaseModel):
@@ -3627,7 +3632,9 @@ def get_bot_status(
         "last_error_code": str(account["last_error_code"] or ""),
         "last_verified_at": account["last_verified_at"],
         "last_sync_at": account["last_sync_at"],
+        "identity_fingerprint": str(account["account_ref"] or ""),
     }
+    result["local_login_import"] = {"supported": True, "identity_check_required": True}
     result["desired_running"] = bool(runtime and runtime["desired_state"] == "running")
     result["runtime_state"] = str(runtime["state"]) if runtime else "stopped"
     auth_state = _read_auth_status(user["id"], account_key)
@@ -5116,11 +5123,86 @@ def save_cookies(
     cookies = body.cookies.strip()
     if not cookies or len(cookies) > 32768:
         raise _cookie_http_error("cookie_invalid", "Cookie 内容无效或过长，请重新复制完整 Cookie", 400)
+    if body.expected_account_ref is not None:
+        return _import_local_login(user, account, cookies, body.expected_account_ref, body.resume)
+    if body.resume:
+        raise _cookie_http_error("identity_required", "本地登录同步必须提供账号校验信息", 400)
     if bot_status(user["id"], account_key).get("running") and not _same_saved_cookie(
         user["id"], account_key, cookies
     ):
         raise _cookie_http_error("bot_running", "请先暂停自动客服，再更新店铺 Cookie", 409)
     return _shop_sync_payload(_run_shop_sync(user["id"], cookies, replace_cookie=True, account=account))
+
+
+def _import_local_login(user, account, cookies: str, expected_ref: str, resume: bool) -> dict:
+    """Validate a local login, then pause/swap/resume under shop ownership.
+
+    The legacy paste-Cookie flow keeps its existing behavior. This opt-in
+    path never rebinds an established shop to a different Xianyu identity.
+    """
+    if resume and not has_permission(user, "automation.rules"):
+        _require_permission(user, "automation.ai")
+    try:
+        normalized, parsed = parse_cookie_header(cookies)
+    except ShopSyncError as error:
+        raise _shop_sync_http_error(error) from None
+    candidate_ref = account_ref(parsed)
+    if not secrets.compare_digest(candidate_ref, expected_ref):
+        raise _cookie_http_error("account_mismatch", "本地登录账号校验不一致，未更新线上店铺", 409)
+    account_key = str(account["account_key"])
+    saved_ref = str(account["account_ref"] or "")
+    previous_cookie = read_secret(user["id"], "cookies.txt", account_key)
+    if not saved_ref and previous_cookie:
+        try:
+            saved_ref = account_ref(parse_cookie_header(previous_cookie)[1])
+        except ShopSyncError:
+            raise _cookie_http_error("account_identity_unknown", "线上原登录信息无法校验，请先确认店铺身份", 409) from None
+    if saved_ref and not secrets.compare_digest(saved_ref, candidate_ref):
+        raise _cookie_http_error("account_mismatch", "本地登录账号与指定线上店铺不同，未替换登录态", 409)
+    previous_runtime = db.get_worker_runtime(user["id"], account["id"])
+    previous_auto_resume = int(_runtime_auto_resume(previous_runtime))
+    owner = "local-login:" + secrets.token_urlsafe(24)
+    try:
+        lease = _qr_connections.acquire_qr(user["id"], account_key, owner, SYNC_MAX_SECONDS + 180)
+    except ShopSyncError as error:
+        raise _shop_sync_http_error(error) from None
+    except ShopSyncPersistenceError as error:
+        raise HTTPException(409, "店铺状态已变更，请刷新后重试") from error
+    worker_paused = False
+
+    def pause_after_verification():
+        nonlocal worker_paused
+        _qr_connections.renew(lease, SYNC_MAX_SECONDS + 180)
+        current = db.get_shop_account(user["id"], account_id=account["id"])
+        current_ref = str(current["account_ref"] or "") if current is not None else ""
+        if current_ref and not secrets.compare_digest(current_ref, candidate_ref):
+            raise _cookie_http_error("account_mismatch", "线上店铺身份已变更，本次同步已取消", 409)
+        # run_shop_sync_inner invokes this only after a real platform profile
+        # check and before any Cookie or catalog files are replaced.
+        _pause_account_worker_for_login_replace(user["id"], account)
+        worker_paused = True
+        if resume:
+            db.set_worker_auto_resume(user["id"], account["id"], 1)
+
+    try:
+        snapshot = _run_shop_sync(
+            user["id"], normalized, replace_cookie=True, account=account,
+            before_replace_persist=pause_after_verification,
+            connection_lease=lease,
+        )
+    except Exception:
+        if worker_paused:
+            try:
+                db.set_worker_auto_resume(user["id"], account["id"], previous_auto_resume)
+                _autostart_account_worker(user["id"], account)
+            except Exception:
+                pass
+        raise
+    finally:
+        _qr_connections.release(lease)
+    payload = _shop_sync_payload(snapshot)
+    payload.update({"account_key": account_key, "identity_fingerprint": candidate_ref})
+    return payload
 
 
 @app.post("/api/bot/shop/sync")
