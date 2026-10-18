@@ -2011,6 +2011,9 @@ input:focus, textarea:focus, select:focus { border-color: var(--brand-yellow-hov
 .qr-login-copy strong, .qr-login-copy p { display: block; }
 .qr-login-copy strong { font-size: 15px; }
 .qr-login-copy p { margin-top: 4px; color: var(--ink-soft); font-size: 12px; }
+.qr-verification-form { width: 100%; display: grid; gap: 10px; }
+.qr-verification-form p { font-size: 12px; color: var(--ink-soft); line-height: 1.6; }
+.qr-verification-form input { width: 100%; min-width: 0; }
 @keyframes qr-login-spin { to { transform: rotate(360deg); } }
 .batch-delivery-body { display: grid; gap: 14px; padding: 4px 20px 0; }
 .batch-delivery-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface-soft); }

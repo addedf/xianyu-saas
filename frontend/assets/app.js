@@ -2464,7 +2464,9 @@
       starting: ["正在生成二维码", "请稍候"],
       waiting: ["请使用闲鱼 App 扫码", "打开闲鱼 App，扫描上方二维码"],
       scanned: ["已扫码", "请在手机上确认登录"],
-      syncing: ["登录成功", "正在识别店铺和商品"],
+      verification_required: ["需要闲鱼安全验证", "请打开官方验证页，按提示完成校验后继续连接。请保留当前会话。"],
+      verifying: ["正在确认校验结果", "正在通过闲鱼官方接口继续连接"],
+      syncing: ["正在连接店铺", "正在识别店铺和商品"],
       sync_error: ["店铺识别未完成", login.retryAction === "complete" ? "冷却已结束，可以重试本次店铺识别。" : "请重新扫码后再连接店铺。"],
       cooldown: ["连接暂时等待", login.retryAction === "start" ? `请等待 ${wait} 秒后再生成二维码。` : `请等待 ${wait} 秒后再继续，本次会话剩余 ${remaining} 秒。`],
       ready: ["可以开始连接", "等待已结束，请生成二维码后扫码。"],
@@ -2487,6 +2489,23 @@
     const image = $("#xianyuQrImage");
     const showQr = ["waiting", "scanned", "paused"].includes(login.status) && Boolean(login.objectUrl);
     if (image) image.hidden = !showQr;
+    const verification = ["verification_required", "verifying"].includes(login.status);
+    const frame = $("#qrLoginFrame");
+    if (frame) frame.hidden = verification;
+    const verificationLink = $("#xianyuVerificationLink");
+    if (verificationLink) {
+      verificationLink.hidden = !verification;
+      if (verification && login.loginId && login.accountKey) {
+        verificationLink.href = API_PREFIX + "/api/bot/login/" + encodeURIComponent(login.loginId)
+          + "/verification?account_key=" + encodeURIComponent(login.accountKey);
+      } else verificationLink.removeAttribute("href");
+    }
+    const verificationForm = $("#xianyuVerificationForm");
+    if (verificationForm) verificationForm.hidden = !verification;
+    const verificationSubmit = $("#completeXianyuVerification");
+    if (verificationSubmit) verificationSubmit.disabled = Boolean(login.operation);
+    const verificationInput = $("#xianyuVerificationCallback");
+    if (verificationInput) verificationInput.disabled = Boolean(login.operation);
     const placeholder = $("#qrLoginPlaceholder");
     if (placeholder) {
       placeholder.hidden = showQr;
@@ -2494,7 +2513,7 @@
       const icon = placeholder.querySelector("use");
       if (icon) icon.setAttribute("href", ICONS + (wait ? "clock" : "refresh-cw"));
     }
-    if (wait || (remaining && ["waiting", "scanned", "sync_error", "cooldown", "paused"].includes(login.status))) {
+    if (wait || (remaining && ["waiting", "scanned", "verification_required", "verifying", "sync_error", "cooldown", "paused"].includes(login.status))) {
       const generation = login.generation;
       login.retryTimer = window.setTimeout(() => {
         if (state.qrLogin.generation === generation) renderQrLogin();
@@ -2506,6 +2525,8 @@
     clearQrLoginPoll();
     clearQrLoginClock();
     clearQrLoginImage();
+    const verificationInput = $("#xianyuVerificationCallback");
+    if (verificationInput) verificationInput.value = "";
     const placeholder = $("#qrLoginPlaceholder");
     if (placeholder) placeholder.hidden = false;
     state.qrLogin = {
@@ -2647,6 +2668,52 @@
     }
   }
 
+  async function finishXianyuVerification(event) {
+    event.preventDefault();
+    const login = state.qrLogin;
+    const input = $("#xianyuVerificationCallback");
+    const callbackUrl = String(input?.value || "").trim();
+    if (login.operation || !login.loginId || login.status !== "verification_required") return;
+    if (!callbackUrl || callbackUrl.length > 8192) {
+      showToast("请填写闲鱼官方验证完成页面的地址", "warning");
+      return;
+    }
+    clearQrLoginPoll();
+    login.operation = "verification";
+    login.status = "verifying";
+    login.message = "";
+    if (input) input.value = "";
+    renderQrLogin();
+    try {
+      const result = await api("/api/bot/login/" + encodeURIComponent(login.loginId) + "/verification/complete", qrLoginRequestOptions(login.accountKey, {
+        method: "POST", body: JSON.stringify({ callback_url: callbackUrl }),
+      }));
+      if (state.qrLogin !== login) return;
+      if (!loginResponseIsSafe(result)) throw new ApiError("校验响应无效，请重新连接");
+      login.operation = "";
+      recordQrExpiry(result?.expires_in);
+      if (result?.status === "confirmed") {
+        await completeQrLogin(login.generation);
+        return;
+      }
+      login.status = "verification_required";
+      login.message = typeof result?.message === "string" ? result.message : "请按官方页面提示完成校验";
+      scheduleQrLoginPoll(login.generation, 6000);
+    } catch (error) {
+      if (state.qrLogin !== login) return;
+      if (error?.code === "invalid_request" || error?.status === 400) {
+        login.status = "verification_required";
+        login.message = "请填写官方校验完成后跳转的页面地址。校验页面本身的链接不能用于继续登录。";
+        scheduleQrLoginPoll(login.generation, 6000);
+      } else applyQrLoginError(error, "verification");
+    } finally {
+      if (state.qrLogin === login) {
+        login.operation = "";
+        renderQrLogin();
+      }
+    }
+  }
+
   async function pollQrLogin(generation) {
     const login = state.qrLogin;
     const loginId = login.loginId;
@@ -2673,7 +2740,11 @@
         await completeQrLogin(generation);
         return;
       }
-      if (status === "syncing") {
+      if (status === "verification_required") {
+        state.qrLogin.status = "verification_required";
+        state.qrLogin.pollAttempts = 0;
+        clearQrLoginImage();
+      } else if (status === "syncing") {
         state.qrLogin.status = "syncing";
       } else if (status === "scanned") {
         state.qrLogin.status = "scanned";
@@ -2687,7 +2758,7 @@
       state.qrLogin.message = typeof result?.message === "string" ? result.message : "";
       renderQrLogin();
       if (state.qrLogin.status !== "expired") {
-        const delay = state.qrLogin.status === "scanned"
+        const delay = state.qrLogin.status === "verification_required" ? 6000 : state.qrLogin.status === "scanned"
           ? QR_LOGIN_POLL_MS
           : Math.min(6000, Math.round(QR_LOGIN_POLL_MS * (1.45 ** Math.min(state.qrLogin.pollAttempts, 4))));
         scheduleQrLoginPoll(generation, delay);
@@ -10115,6 +10186,7 @@
     });
     $("#headerLogoutButton").addEventListener("click", logout);
     $("#xianyuConnectButton").addEventListener("click", startXianyuLogin);
+    $("#xianyuVerificationForm")?.addEventListener("submit", finishXianyuVerification);
     $("#refreshXianyuLogin").addEventListener("click", () => {
       const login = state.qrLogin;
       if (login.operation || login.polling || qrRemaining(login.retryAt)) return;
