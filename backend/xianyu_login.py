@@ -8,6 +8,7 @@ reports a successful durable save with ``finish_consume``.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -322,34 +323,45 @@ def _query_token(value) -> str:
 def _login_token(data: dict) -> str:
     for key in ("token", "lgToken", "loginToken"):
         direct = data.get(key)
-        if direct is not None:
+        if direct not in (None, ""):
             return _opaque_token(direct)
     # Current passport flows can place the one-time token in the login iframe
     # URL instead of returning a separate token field. Never follow that URL.
     redirect = data.get("iframeRedirectUrl")
     if data.get("iframeRedirect") is True and isinstance(redirect, str):
         parsed = urlsplit(redirect)
-        if (
-            len(redirect) > 8192 or parsed.scheme != "https"
-            or parsed.hostname != PASSPORT_HOST or parsed.path != "/login_token/login.do"
-            or parsed.username is not None or parsed.password is not None
-            or parsed.port not in (None, 443) or parsed.fragment
-        ):
+        if len(redirect) > 8192:
             raise XianyuLoginError("platform_error")
-        tokens = parse_qs(parsed.query, max_num_fields=32).get("token", [])
-        if len(tokens) == 1:
-            return _opaque_token(tokens[0])
+        if (
+            parsed.scheme == "https" and parsed.hostname == PASSPORT_HOST
+            and parsed.path == "/login_token/login.do"
+            and parsed.username is None and parsed.password is None
+            and parsed.port in (None, 443) and not parsed.fragment
+        ):
+            tokens = parse_qs(parsed.query, max_num_fields=32).get("token", [])
+            if len(tokens) == 1:
+                return _opaque_token(tokens[0])
     extension = data.get("bizExt")
     if extension is None:
         return ""
     if isinstance(extension, str) and 2 <= len(extension) <= 8192:
         try:
-            extension = json.loads(extension)
-        except (TypeError, ValueError):
+            if extension.lstrip().startswith("{"):
+                extension = json.loads(extension)
+            else:
+                decoded = base64.b64decode(
+                    extension + "=" * (-len(extension) % 4), altchars=b"-_", validate=True,
+                )
+                extension = json.loads(decoded.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeError):
             raise XianyuLoginError("platform_error") from None
     if not isinstance(extension, dict):
         raise XianyuLoginError("platform_error")
-    return _opaque_token(extension.get("loginToken"))
+    # Some confirmed responses complete authentication with Set-Cookie only.
+    # The final Cookie validation and authenticated profile lookup remain
+    # mandatory even when the extension contains no separate one-time token.
+    token = extension.get("loginToken")
+    return _opaque_token(token) if token not in (None, "") else ""
 
 
 def _validate_svg(value) -> bytes:
@@ -848,6 +860,18 @@ class XianyuLoginManager:
             elif upstream_status in {"EXPIRED", "CANCELED"}:
                 next_status = "expired"
             elif upstream_status == "CONFIRMED":
+                extension = data.get("bizExt")
+                extension_format = (
+                    "object" if isinstance(extension, dict) else
+                    "json" if isinstance(extension, str) and extension.lstrip().startswith("{") else
+                    "encoded" if isinstance(extension, str) else "absent"
+                )
+                LOGGER.warning(
+                    "qr_confirmation_shape: biz_ext_format=%s direct_token_present=%s iframe_redirect=%s",
+                    extension_format,
+                    any(data.get(key) not in (None, "") for key in ("token", "lgToken", "loginToken")),
+                    data.get("iframeRedirect") is True,
+                )
                 try:
                     login_token = _login_token(data)
                 except XianyuLoginError:
