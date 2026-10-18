@@ -2427,7 +2427,7 @@
         // Only the opaque flow ID is retained; credentials and verification
         // callback URLs stay out of browser storage.
         sessionStorage.setItem(QR_VERIFICATION_STORAGE_KEY, JSON.stringify({
-          ownerId: String(state.me?.id || ""), accountKey: login.accountKey,
+          owner: String(state.me?.username || ""), accountKey: login.accountKey,
           loginId: login.loginId, expiresAt: login.expiresAt,
         }));
       } else if (["idle", "starting", "waiting", "scanned", "connected", "expired", "error"].includes(login.status)) {
@@ -2441,7 +2441,7 @@
     try { saved = JSON.parse(sessionStorage.getItem(QR_VERIFICATION_STORAGE_KEY) || "null"); }
     catch (error) { return; }
     if (!saved) return;
-    if (saved.ownerId !== String(state.me?.id || "") || saved.accountKey !== state.activeAccountKey
+    if (!saved.owner || saved.owner !== String(state.me?.username || "") || saved.accountKey !== state.activeAccountKey
       || !/^[A-Za-z0-9_-]{16,128}$/.test(String(saved.loginId || ""))
       || !Number.isFinite(saved.expiresAt) || !qrRemaining(saved.expiresAt)
       || saved.expiresAt > Date.now() + 600_000) {
