@@ -1500,6 +1500,13 @@ class XianyuLoginCompleteIn(BaseModel):
         extra = "forbid"
 
 
+class XianyuVerificationCompleteIn(BaseModel):
+    callback_url: str = Field(min_length=1, max_length=8192)
+
+    class Config:
+        extra = "forbid"
+
+
 class CodesIn(BaseModel):
     codes: list
 
@@ -2626,6 +2633,8 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "login_confirm_failed": 422,
         "mtop_context_failed": 422,
         "qr_cookie_incomplete": 422,
+        "verification_required": 409,
+        "verification_failed": 422,
         "network_error": 503,
         "platform_error": 502,
     }
@@ -4930,6 +4939,46 @@ def xianyu_login_status(
         )
         if result.get("status") == "error":
             raise XianyuLoginError(str(result.get("code") or "platform_error"))
+        return result
+    except ShopSyncError as error:
+        raise _shop_sync_http_error(error) from None
+    except XianyuLoginError as error:
+        raise _xianyu_login_http_error(error) from None
+
+
+@app.get("/api/bot/login/{login_id}/verification")
+def open_xianyu_verification(
+    login_id: str,
+    account_key: str = Query(default="default", min_length=1, max_length=80),
+    user=Depends(Auth.current_user),
+):
+    _require_permission(user, "shop.configure")
+    account = db.get_shop_account(user["id"], account_key=account_key)
+    if account is None or not account["enabled"]:
+        raise HTTPException(404, "店铺账号不存在或已停用")
+    try:
+        url = qr_logins.verification_url(user["id"], login_id, account_key)
+    except XianyuLoginError as error:
+        raise _xianyu_login_http_error(error) from None
+    return RedirectResponse(url, status_code=303, headers={
+        "Cache-Control": "no-store", "Referrer-Policy": "no-referrer",
+    })
+
+
+@app.post("/api/bot/login/{login_id}/verification/complete")
+def complete_xianyu_verification(
+    login_id: str,
+    body: XianyuVerificationCompleteIn,
+    user=Depends(Auth.current_user),
+    account=Depends(current_shop_account),
+):
+    _require_permission(user, "shop.configure")
+    try:
+        result = qr_logins.finish_verification(
+            user["id"], login_id, body.callback_url, str(account["account_key"]),
+        )
+        if result.get("status") == "error":
+            raise XianyuLoginError(str(result.get("code") or "verification_failed"))
         return result
     except ShopSyncError as error:
         raise _shop_sync_http_error(error) from None
