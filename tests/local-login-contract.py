@@ -193,6 +193,9 @@ def main() -> None:
         create_account(client, "unknown-shop")
         unknown_headers = {"X-Shop-Account": "unknown-shop"}
         candidate = "unb=620003; _m_h5_tk=candidate-token_tail; sid=candidate"
+        initial_status = client.get("/api/bot/status", headers=unknown_headers)
+        assert initial_status.status_code == 200, initial_status.text
+        assert initial_status.json()["local_login_import"]["initial_bind_allowed"] is True
         unknown = client.put(
             "/api/bot/cookies",
             headers=unknown_headers,
@@ -205,6 +208,21 @@ def main() -> None:
         assert unknown.status_code == 409, unknown.text
         assert unknown.json()["detail"]["code"] == "account_identity_unknown"
         assert not app.read_secret(user_id, "cookies.txt", "unknown-shop")
+        initial = client.put(
+            "/api/bot/cookies",
+            headers=unknown_headers,
+            json={
+                "cookies": candidate,
+                "expected_account_ref": shop_sync.account_ref(shop_sync.parse_cookie_header(candidate)[1]),
+                "resume": True,
+                "allow_initial_bind": True,
+            },
+        )
+        assert initial.status_code == 200, initial.text
+        assert initial.json()["identity_fingerprint"] == shop_sync.account_ref(
+            shop_sync.parse_cookie_header(candidate)[1]
+        )
+        assert app.read_secret(user_id, "cookies.txt", "unknown-shop") == candidate
 
         # Legacy installations may have the identity in cookies.txt but not in
         # the account row; status derives only the bounded fingerprint.

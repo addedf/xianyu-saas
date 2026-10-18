@@ -1496,6 +1496,7 @@ class CookiesIn(BaseModel):
     cookies: str
     expected_account_ref: str | None = Field(default=None, pattern=r"^[a-f0-9]{16}$")
     resume: bool = False
+    allow_initial_bind: bool = False
 
 
 class XianyuLoginCompleteIn(BaseModel):
@@ -3650,7 +3651,16 @@ def get_bot_status(
         "last_sync_at": account["last_sync_at"],
         "identity_fingerprint": _account_identity_fingerprint(user["id"], account),
     }
-    result["local_login_import"] = {"supported": True, "identity_check_required": True}
+    identity_fingerprint = str(result["account"].get("identity_fingerprint") or "")
+    result["local_login_import"] = {
+        "supported": True,
+        "identity_check_required": True,
+        "initial_bind_allowed": bool(
+            not identity_fingerprint
+            and str(account["status"] or "unconfigured") == "unconfigured"
+            and not read_secret(user["id"], "cookies.txt", account_key)
+        ),
+    }
     result["desired_running"] = bool(runtime and runtime["desired_state"] == "running")
     result["runtime_state"] = str(runtime["state"]) if runtime else "stopped"
     auth_state = _read_auth_status(user["id"], account_key)
@@ -5140,7 +5150,14 @@ def save_cookies(
     if not cookies or len(cookies) > 32768:
         raise _cookie_http_error("cookie_invalid", "Cookie 内容无效或过长，请重新复制完整 Cookie", 400)
     if body.expected_account_ref is not None:
-        return _import_local_login(user, account, cookies, body.expected_account_ref, body.resume)
+        return _import_local_login(
+            user,
+            account,
+            cookies,
+            body.expected_account_ref,
+            body.resume,
+            body.allow_initial_bind,
+        )
     if body.resume:
         raise _cookie_http_error("identity_required", "本地登录同步必须提供账号校验信息", 400)
     if bot_status(user["id"], account_key).get("running") and not _same_saved_cookie(
@@ -5150,7 +5167,14 @@ def save_cookies(
     return _shop_sync_payload(_run_shop_sync(user["id"], cookies, replace_cookie=True, account=account))
 
 
-def _import_local_login(user, account, cookies: str, expected_ref: str, resume: bool) -> dict:
+def _import_local_login(
+    user,
+    account,
+    cookies: str,
+    expected_ref: str,
+    resume: bool,
+    allow_initial_bind: bool = False,
+) -> dict:
     """Validate a local login, then pause/swap/resume under shop ownership.
 
     The legacy paste-Cookie flow keeps its existing behavior. This opt-in
@@ -5166,9 +5190,16 @@ def _import_local_login(user, account, cookies: str, expected_ref: str, resume: 
     if not secrets.compare_digest(candidate_ref, expected_ref):
         raise _cookie_http_error("account_mismatch", "本地登录账号校验不一致，未更新线上店铺", 409)
     account_key = str(account["account_key"])
+    previous_cookie = read_secret(user["id"], "cookies.txt", account_key)
     saved_ref = _account_identity_fingerprint(user["id"], account)
     if not saved_ref:
-        raise _cookie_http_error("account_identity_unknown", "线上原登录信息无法确认店铺身份，未替换登录态", 409)
+        initial_bind_allowed = (
+            allow_initial_bind
+            and str(account["status"] or "unconfigured") == "unconfigured"
+            and not previous_cookie
+        )
+        if not initial_bind_allowed:
+            raise _cookie_http_error("account_identity_unknown", "线上原登录信息无法确认店铺身份，未替换登录态", 409)
     if saved_ref and not secrets.compare_digest(saved_ref, candidate_ref):
         raise _cookie_http_error("account_mismatch", "本地登录账号与指定线上店铺不同，未替换登录态", 409)
     previous_runtime = db.get_worker_runtime(user["id"], account["id"])

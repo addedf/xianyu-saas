@@ -116,6 +116,7 @@ class OnlineWorkbench:
                     known = {
                         "account_mismatch": "本地闲鱼账号与指定线上店铺不一致，未替换登录态。",
                         "account_identity_unknown": "线上原登录信息无法确认身份，请先确认店铺。",
+                        "identity_required": "本地登录同步缺少线上身份校验信息，请重新检查目标店铺。",
                         "verification_required": "线上仍要求闲鱼官方安全验证；本次登录态未完成接管。",
                         "risk_control": "闲鱼仍限制服务器当前请求，Cookie 同步不能保证解除平台限制。",
                         "risk_cooldown": "线上处于请求保护冷却期，请稍后再同步。",
@@ -299,6 +300,7 @@ def main() -> int:
     parser.add_argument("--cookie-file", type=Path, help="使用已有本地 Cookie 文件（权限 600），替代重新扫码")
     parser.add_argument("--timeout", type=int, default=600, help="等待本人登录的秒数，60 至 600")
     parser.add_argument("--no-resume", action="store_true", help="保留线上原有的运行意愿，不主动重新启用已暂停店铺")
+    parser.add_argument("--allow-initial-bind", action="store_true", help="确认将本机闲鱼账号首次绑定到没有历史身份的线上店铺")
     parser.add_argument("--check", action="store_true", help="仅检查线上账号、店铺和导入能力，不读取或同步闲鱼 Cookie")
     args = parser.parse_args()
     settings = json.loads(private_read(CONFIG)) if CONFIG.exists() else {}
@@ -316,12 +318,25 @@ def main() -> int:
         if status.get("account", {}).get("key") != key or not status.get("local_login_import", {}).get("identity_check_required"):
             raise SyncError("线上版本尚不支持带账号校验的本地登录导入，请先更新对应功能。")
         expected = str(status.get("account", {}).get("identity_fingerprint") or "")
-        if not FINGERPRINT.fullmatch(expected):
+        import_capability = status.get("local_login_import") or {}
+        initial_bind = False
+        if expected and not FINGERPRINT.fullmatch(expected):
             raise SyncError("线上店铺身份信息无效，操作已停止。")
+        if not expected:
+            if import_capability.get("initial_bind_allowed") is not True:
+                raise SyncError("线上店铺没有可核验的历史身份，未允许首次绑定。")
+            initial_bind = True
         print(f"目标店铺：{account.get('name') or key} ({key})", flush=True)
         if args.check:
-            print("线上认证、目标店铺及安全导入能力均可用；未同步 Cookie、未启动店铺。", flush=True)
+            suffix = "（允许显式首次绑定）" if initial_bind else ""
+            print(f"线上认证、目标店铺及安全导入能力均可用{suffix}；未同步 Cookie、未启动店铺。", flush=True)
             return 0
+        if initial_bind and not args.allow_initial_bind:
+            if not sys.stdin.isatty():
+                raise SyncError("首次绑定需要在交互终端确认，或使用 --allow-initial-bind。")
+            answer = input("线上店铺没有历史闲鱼身份；本次会把本机账号绑定到该店铺。继续？[y/N] ").strip().lower()
+            if answer not in {"y", "yes"}:
+                raise SyncError("已取消首次绑定，线上店铺未变更。")
         cookie = private_read(args.cookie_file, 32768).strip() if args.cookie_file else capture_local_login(max(60, min(args.timeout, 600)))
         sys.path.insert(0, str(ROOT / "backend"))
         from shop_sync import parse_cookie_header, account_ref
@@ -332,6 +347,7 @@ def main() -> int:
         print("本机登录完成，正在通过 HTTPS 验证并更新指定线上店铺……", flush=True)
         result = workbench.call("PUT", "bot/cookies", account=key, payload={
             "cookies": cookie, "expected_account_ref": fingerprint, "resume": not args.no_resume,
+            "allow_initial_bind": initial_bind,
         })
         cookie = ""
         if result.get("account_key") != key or result.get("identity_fingerprint") != fingerprint or result.get("connected") is not True:
