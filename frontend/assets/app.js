@@ -4,6 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
+  const QR_VERIFICATION_STORAGE_KEY = "xianyu-saas.qr-verification";
   const ASSET_VERSION = "20261003-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
@@ -2419,6 +2420,60 @@
     }
   }
 
+  function rememberQrVerification() {
+    const login = state.qrLogin;
+    try {
+      if (["verification_required", "verifying"].includes(login.status) && login.loginId && qrRemaining(login.expiresAt)) {
+        // Only the opaque flow ID is retained; credentials and verification
+        // callback URLs stay out of browser storage.
+        sessionStorage.setItem(QR_VERIFICATION_STORAGE_KEY, JSON.stringify({
+          ownerId: String(state.me?.id || ""), accountKey: login.accountKey,
+          loginId: login.loginId, expiresAt: login.expiresAt,
+        }));
+      } else if (["idle", "starting", "waiting", "scanned", "connected", "expired", "error"].includes(login.status)) {
+        sessionStorage.removeItem(QR_VERIFICATION_STORAGE_KEY);
+      }
+    } catch (error) { /* Storage may be disabled; the server still bounds the flow lifetime. */ }
+  }
+
+  async function resumeQrVerification() {
+    let saved;
+    try { saved = JSON.parse(sessionStorage.getItem(QR_VERIFICATION_STORAGE_KEY) || "null"); }
+    catch (error) { return; }
+    if (!saved) return;
+    if (saved.ownerId !== String(state.me?.id || "") || saved.accountKey !== state.activeAccountKey
+      || !/^[A-Za-z0-9_-]{16,128}$/.test(String(saved.loginId || ""))
+      || !Number.isFinite(saved.expiresAt) || !qrRemaining(saved.expiresAt)
+      || saved.expiresAt > Date.now() + 600_000) {
+      try { sessionStorage.removeItem(QR_VERIFICATION_STORAGE_KEY); } catch (error) { /* Optional storage. */ }
+      return;
+    }
+    const accountEpoch = state.accountEpoch;
+    try {
+      const result = await api("/api/bot/login/" + encodeURIComponent(saved.loginId) + "/status", qrLoginRequestOptions(saved.accountKey));
+      if (accountEpoch !== state.accountEpoch || saved.accountKey !== state.activeAccountKey) return;
+      if (!loginResponseIsSafe(result) || !["verification_required", "confirmed"].includes(result?.status)) {
+        sessionStorage.removeItem(QR_VERIFICATION_STORAGE_KEY);
+        return;
+      }
+      resetQrLogin();
+      const login = state.qrLogin;
+      login.loginId = saved.loginId;
+      login.accountKey = saved.accountKey;
+      login.status = "verification_required";
+      recordQrExpiry(result.expires_in);
+      openQrLoginDialog();
+      renderQrLogin();
+      if (result.status === "confirmed") await completeQrLogin(login.generation);
+      else scheduleQrLoginPoll(login.generation, 6000);
+    } catch (error) {
+      if ([401, 403, 404, 410].includes(error?.status)) {
+        try { sessionStorage.removeItem(QR_VERIFICATION_STORAGE_KEY); } catch (storageError) { /* Optional storage. */ }
+      }
+      showToast("上次安全验证暂未恢复，请保留验证完成页，稍后刷新工作台。", "warning");
+    }
+  }
+
   function applyQrLoginError(error, action) {
     const login = state.qrLogin;
     const detail = error?.detail && typeof error.detail === "object" ? error.detail : {};
@@ -2511,6 +2566,7 @@
     if (verificationSubmit) verificationSubmit.disabled = Boolean(login.operation);
     const verificationInput = $("#xianyuVerificationCallback");
     if (verificationInput) verificationInput.disabled = Boolean(login.operation);
+    rememberQrVerification();
     const placeholder = $("#qrLoginPlaceholder");
     if (placeholder) {
       placeholder.hidden = showQr;
@@ -2527,6 +2583,7 @@
   }
 
   function resetQrLogin() {
+    try { sessionStorage.removeItem(QR_VERIFICATION_STORAGE_KEY); } catch (error) { /* Optional storage. */ }
     clearQrLoginPoll();
     clearQrLoginClock();
     clearQrLoginImage();
@@ -9033,6 +9090,7 @@
     $("#authScreen").hidden = true;
     $("#workspace").hidden = false;
     showView(state.view || "home", true);
+    await resumeQrVerification();
   }
 
   function isMobileSidebar() {
@@ -10594,6 +10652,10 @@
       const loginId = state.qrLogin.loginId;
       const accountKey = state.qrLogin.accountKey;
       if (!loginId || !accountKey) return;
+      if (["verification_required", "verifying", "syncing"].includes(state.qrLogin.status)) {
+        rememberQrVerification();
+        return;
+      }
       void fetch(API_PREFIX + "/api/bot/login/" + encodeURIComponent(loginId) + "/cancel", {
         method: "POST",
         headers: {
