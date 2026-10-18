@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 LOGGER = logging.getLogger(__name__)
 _CAPACITY = threading.BoundedSemaphore(1)
 _DOMAINS = ("goofish.com", "taobao.com", "alicdn.com", "alipay.com", "mmstat.com", "aliyun.com", "alibaba.com")
-_WIDTH, _HEIGHT = 420, 560
+_WIDTH, _HEIGHT = 900, 560
 _OFFICIAL_LOGIN_PAGE = (
     "https://passport.goofish.com/mini_login.htm?lang=zh_cn&appName=xianyu"
     "&appEntrance=web&styleType=vertical&notLoadSsoView=false&notKeepLogin=false"
