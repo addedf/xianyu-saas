@@ -27,6 +27,10 @@ chmod 600 config/saas.env
 ./local.command stop    # 停止服务，保留数据
 ```
 
+线上接管店铺后，可用 `SAAS_LOCAL_OBSERVE_ONLY=1 ./local.command start` 只启动本地 API 和网页，不启动任务消费者，并关闭店铺自动恢复及自更新。此方式不会同步线上新订单，也不是限制所有 API 写入或外部请求的完整隔离环境；不要手动启动本地店铺。测试订单由线上采集，再另取快照到本地分析。
+
+执行 `./同步闲鱼登录.command` 时，启动器会自动使用 `SAAS_LOCAL_LOGIN_ONLY=1` 的登录专用模式：本地工作台可完成闲鱼扫码并保存店铺 Cookie，但登录完成后的自动恢复不会拉起本地 Worker。同步完成后本地服务默认停止。
+
 访问 <http://127.0.0.1:4173/xianyu-saas/>，首次在页面设置管理员账号和密码，密码至少 12 位。
 
 本地配置在 `config/saas.env`，数据库、加密主密钥、店铺数据和日志在 `.local/`；这些文件均被 Git 忽略。日志为 `.local/local.log` 和 `.local/local-logs/`，后者分别记录 API、consumer、Web。

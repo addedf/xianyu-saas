@@ -2355,6 +2355,13 @@ def _runtime_auto_resume(runtime) -> bool:
         return True
 
 
+def _local_login_only() -> bool:
+    """Keep the Mac login-only workbench from spawning a shop Worker."""
+    return os.environ.get("SAAS_LOCAL_LOGIN_ONLY", "0").strip().lower() in {
+        "1", "true", "yes",
+    }
+
+
 def _autostart_account_worker(user_id: int, account) -> dict:
     """Clear verified auth state and resume durable running intent idempotently."""
     if maintenance_active():
@@ -2402,6 +2409,8 @@ def _autostart_account_worker(user_id: int, account) -> dict:
             return _worker_transition_payload(user_id, account, "auth_status_clear_failed")
         if maintenance_active():
             return _maintenance_worker_transition_payload(user_id, account)
+        if _local_login_only():
+            return _worker_transition_payload(user_id, account, "local_login_only")
         if runtime is None or (
             runtime["desired_state"] != "running" and not _runtime_auto_resume(runtime)
         ):

@@ -190,6 +190,26 @@ def main() -> None:
         assert app.read_secret(user_id, "cookies.txt", "local-shop") == replacement
         assert "local-shop" in running
 
+        # The local login-only workbench must complete the verified sync while
+        # leaving the local shop Worker stopped. The online deployment keeps
+        # the normal autostart path because this flag is process-local.
+        running.pop("local-shop", None)
+        local_only_cookie = "unb=620001; _m_h5_tk=local-only-token_tail; sid=local-only"
+        with patch.dict(os.environ, {"SAAS_LOCAL_LOGIN_ONLY": "1"}):
+            local_only = client.put(
+                "/api/bot/cookies",
+                headers=headers,
+                json={
+                    "cookies": local_only_cookie,
+                    "expected_account_ref": identity,
+                    "resume": True,
+                },
+            )
+        assert local_only.status_code == 200, local_only.text
+        assert starts["local-shop"] == 2
+        assert "local-shop" not in running
+        assert local_only.json()["worker"]["code"] == "local_login_only"
+
         create_account(client, "unknown-shop")
         unknown_headers = {"X-Shop-Account": "unknown-shop"}
         candidate = "unb=620003; _m_h5_tk=candidate-token_tail; sid=candidate"
@@ -237,6 +257,8 @@ def main() -> None:
         assert fallback.json()["account"]["identity_fingerprint"] == identity
 
         local_login = load_local_login_script()
+        assert "playwright" not in (ROOT / "scripts/sync-local-login.py").read_text()
+        assert not (ROOT / "scripts/requirements-local-login.txt").exists()
         try:
             local_login.server_address("http://example.test/xianyu-saas")
         except local_login.SyncError:

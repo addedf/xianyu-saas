@@ -38,6 +38,12 @@ from update_maintenance import read_maintenance
 API_PORT = int(os.environ.get("SAAS_DEV_API_PORT", "8096"))
 WEB_PORT = int(os.environ.get("SAAS_DEV_WEB_PORT", "4173"))
 URL = f"http://127.0.0.1:{WEB_PORT}/xianyu-saas/"
+LOGIN_ONLY = os.environ.get("SAAS_LOCAL_LOGIN_ONLY", "0").strip().lower() in {
+    "1", "true", "yes",
+}
+OBSERVE_ONLY = os.environ.get("SAAS_LOCAL_OBSERVE_ONLY", "0").strip().lower() in {
+    "1", "true", "yes",
+} or LOGIN_ONLY
 
 
 def running_pid():
@@ -85,6 +91,11 @@ def run():
         env["SAAS_DEV_API_ORIGIN"] = f"http://127.0.0.1:{API_PORT}"
         env["SAAS_DEV_WEB_PORT"] = str(WEB_PORT)
         env["PYTHONUNBUFFERED"] = "1"
+        if OBSERVE_ONLY:
+            env["SAAS_RESTORE_WORKERS"] = "0"
+            env["SAAS_SELF_UPDATE_ENABLED"] = "0"
+        if LOGIN_ONLY:
+            env["SAAS_LOCAL_LOGIN_ONLY"] = "1"
         python = str(ROOT / "backend/.venv/bin/python")
         services = {
             "api": [python, "-m", "uvicorn", "app:app", "--app-dir", str(ROOT / "backend"),
@@ -92,6 +103,12 @@ def run():
             "consumer": [python, "-m", "job_consumer"],
             "web": ["node", str(ROOT / "scripts/dev-server.mjs")],
         }
+        if OBSERVE_ONLY:
+            services.pop("consumer")
+            if LOGIN_ONLY:
+                print("本地登录专用启动：仅 API 和网页；消费者、店铺自动恢复、登录完成后的 Worker 及自更新已关闭。", flush=True)
+            else:
+                print("本地观察启动：仅 API 和网页；消费者、店铺自动恢复及自更新已关闭。", flush=True)
         log_dir = STATE / "local-logs"
         log_dir.mkdir(mode=0o700, exist_ok=True)
         for name, command in services.items():
