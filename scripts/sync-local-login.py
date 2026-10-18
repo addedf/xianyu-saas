@@ -316,7 +316,7 @@ def main() -> int:
         if status.get("account", {}).get("key") != key or not status.get("local_login_import", {}).get("identity_check_required"):
             raise SyncError("线上版本尚不支持带账号校验的本地登录导入，请先更新对应功能。")
         expected = str(status.get("account", {}).get("identity_fingerprint") or "")
-        if expected and not FINGERPRINT.fullmatch(expected):
+        if not FINGERPRINT.fullmatch(expected):
             raise SyncError("线上店铺身份信息无效，操作已停止。")
         print(f"目标店铺：{account.get('name') or key} ({key})", flush=True)
         if args.check:
@@ -327,7 +327,7 @@ def main() -> int:
         from shop_sync import parse_cookie_header, account_ref
         cookie, parsed = parse_cookie_header(cookie)
         fingerprint = account_ref(parsed)
-        if expected and fingerprint != expected:
+        if fingerprint != expected:
             raise SyncError("本机登录的是另一闲鱼账号，未上传 Cookie、未变更线上店铺。")
         print("本机登录完成，正在通过 HTTPS 验证并更新指定线上店铺……", flush=True)
         result = workbench.call("PUT", "bot/cookies", account=key, payload={

@@ -1753,6 +1753,22 @@ def _shop_account_payload(row, user_id: int | None = None):
     }
 
 
+def _account_identity_fingerprint(user_id: int, account) -> str:
+    """Return the bounded seller fingerprint without exposing the Cookie."""
+    saved_ref = str(account["account_ref"] or "") if account is not None else ""
+    if saved_ref:
+        return saved_ref
+    if account is None:
+        return ""
+    previous_cookie = read_secret(user_id, "cookies.txt", str(account["account_key"]))
+    if not previous_cookie:
+        return ""
+    try:
+        return account_ref(parse_cookie_header(previous_cookie)[1])
+    except ShopSyncError:
+        return ""
+
+
 def _sync_account_state(
     user_id: int,
     code: str,
@@ -3632,7 +3648,7 @@ def get_bot_status(
         "last_error_code": str(account["last_error_code"] or ""),
         "last_verified_at": account["last_verified_at"],
         "last_sync_at": account["last_sync_at"],
-        "identity_fingerprint": str(account["account_ref"] or ""),
+        "identity_fingerprint": _account_identity_fingerprint(user["id"], account),
     }
     result["local_login_import"] = {"supported": True, "identity_check_required": True}
     result["desired_running"] = bool(runtime and runtime["desired_state"] == "running")
@@ -5150,13 +5166,9 @@ def _import_local_login(user, account, cookies: str, expected_ref: str, resume: 
     if not secrets.compare_digest(candidate_ref, expected_ref):
         raise _cookie_http_error("account_mismatch", "本地登录账号校验不一致，未更新线上店铺", 409)
     account_key = str(account["account_key"])
-    saved_ref = str(account["account_ref"] or "")
-    previous_cookie = read_secret(user["id"], "cookies.txt", account_key)
-    if not saved_ref and previous_cookie:
-        try:
-            saved_ref = account_ref(parse_cookie_header(previous_cookie)[1])
-        except ShopSyncError:
-            raise _cookie_http_error("account_identity_unknown", "线上原登录信息无法校验，请先确认店铺身份", 409) from None
+    saved_ref = _account_identity_fingerprint(user["id"], account)
+    if not saved_ref:
+        raise _cookie_http_error("account_identity_unknown", "线上原登录信息无法确认店铺身份，未替换登录态", 409)
     if saved_ref and not secrets.compare_digest(saved_ref, candidate_ref):
         raise _cookie_http_error("account_mismatch", "本地登录账号与指定线上店铺不同，未替换登录态", 409)
     previous_runtime = db.get_worker_runtime(user["id"], account["id"])
