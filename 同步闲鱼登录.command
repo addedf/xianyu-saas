@@ -7,6 +7,9 @@ if [[ ! -x "$python_bin" ]]; then
   exit 1
 fi
 if ! "$python_bin" -c 'from importlib.metadata import version; assert version("playwright") == "1.64.0"' >/dev/null 2>&1; then
+  if ! "$python_bin" -m pip --version >/dev/null 2>&1; then
+    "$python_bin" -m ensurepip --upgrade || exit 1
+  fi
   "$python_bin" -m pip --disable-pip-version-check install -r scripts/requirements-local-login.txt || exit 1
 fi
 "$python_bin" scripts/sync-local-login.py "$@"
