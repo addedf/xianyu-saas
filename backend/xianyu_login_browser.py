@@ -22,7 +22,12 @@ from urllib.parse import urlsplit
 LOGGER = logging.getLogger(__name__)
 _CAPACITY = threading.BoundedSemaphore(1)
 _DOMAINS = ("goofish.com", "taobao.com", "alicdn.com", "alipay.com", "mmstat.com", "aliyun.com", "alibaba.com")
-_WIDTH, _HEIGHT = 1100, 780
+_WIDTH, _HEIGHT = 420, 560
+_OFFICIAL_LOGIN_PAGE = (
+    "https://passport.goofish.com/mini_login.htm?lang=zh_cn&appName=xianyu"
+    "&appEntrance=web&styleType=vertical&notLoadSsoView=false&notKeepLogin=false"
+    "&isMobile=false&qrCodeFirst=false&stie=77"
+)
 _PLACEHOLDER = b'<svg xmlns="http://www.w3.org/2000/svg" width="360" height="420" viewBox="0 0 360 420"><rect width="360" height="420" fill="white"/><text x="180" y="210" text-anchor="middle" font-size="16" fill="#555">\xe6\xad\xa3\xe5\x9c\xa8\xe8\xbd\xbd\xe5\x85\xa5\xe9\x97\xb2\xe9\xb1\xbc\xe5\xae\x98\xe6\x96\xb9\xe7\x99\xbb\xe5\xbd\x95\xe9\xa1\xb5</text></svg>'
 
 
@@ -210,7 +215,7 @@ class OfficialLoginBrowser:
             try:
                 stage = "open"
                 try:
-                    page.goto("https://www.goofish.com/login", wait_until="domcontentloaded", timeout=25000)
+                    page.goto(_OFFICIAL_LOGIN_PAGE, wait_until="domcontentloaded", timeout=25000)
                 except PlaywrightTimeout:
                     if not _allowed_url(page.url):
                         raise
