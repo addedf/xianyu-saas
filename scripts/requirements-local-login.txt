@@ -1,0 +1,2 @@
+# 仅本机授权工具使用已安装的 Google Chrome；不安装到线上应用镜像。
+playwright==1.64.0
