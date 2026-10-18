@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.cookiejar
 import json
 import math
 import os
@@ -22,6 +23,7 @@ APP_KEY = "34839810"
 MTOP_HOST = "https://h5api.m.goofish.com"
 PROFILE_API = "mtop.taobao.idlemessage.pc.loginuser.get"
 PRODUCTS_API = "mtop.idle.web.xyh.item.list"
+PRODUCT_DETAIL_API = "mtop.taobao.idle.pc.detail"
 PAGE_SIZE = 20
 MAX_ITEMS = 100
 MAX_PAGES = 5
@@ -551,6 +553,85 @@ def extract_product(card: dict, synced_at: str) -> dict | None:
     return product
 
 
+def _card_requires_sku(card: dict) -> bool:
+    detail_params = card.get("detailParams") if isinstance(card, dict) else None
+    return isinstance(detail_params, dict) and str(detail_params.get("isSKU", "")).strip() == "1"
+
+
+def _sku_quantity(value) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
+        number = int(value)
+    else:
+        return None
+    return number if 0 <= number <= 1_000_000_000 else None
+
+
+def _sku_price(raw: dict) -> str:
+    value = raw.get("priceInCent")
+    if value is None:
+        value = raw.get("price")
+    if isinstance(value, bool) or value is None:
+        return ""
+    text = str(value).strip()
+    if not text.isascii() or not text.isdigit() or len(text) > 18:
+        return ""
+    cents = int(text)
+    return f"{cents // 100}.{cents % 100:02d}"
+
+
+def extract_sku_details(detail: dict, item_id: str) -> dict:
+    item = detail.get("itemDO") if isinstance(detail, dict) else None
+    if not isinstance(item, dict) or str(item.get("itemId") or "") != item_id:
+        raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+    raw_skus = item.get("skuList")
+    if not isinstance(raw_skus, list) or not 1 <= len(raw_skus) <= 50:
+        raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+
+    skus = []
+    seen = set()
+    for raw in raw_skus:
+        if not isinstance(raw, dict):
+            raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+        sku_id = str(raw.get("skuId") or "").strip()
+        if not sku_id.isascii() or not sku_id.isdigit() or len(sku_id) > 64 or sku_id in seen:
+            raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+        stock = _sku_quantity(raw.get("quantity"))
+        price = _sku_price(raw)
+        properties = []
+        labels = []
+        raw_properties = raw.get("propertyList")
+        if not isinstance(raw_properties, list):
+            raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+        for prop in raw_properties[:20]:
+            if not isinstance(prop, dict):
+                raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+            label = _safe_text(prop.get("valueText") or prop.get("actualValueText"), 80)
+            property_name = _safe_text(prop.get("propertyText") or prop.get("name"), 80)
+            if label:
+                labels.append(label)
+                properties.append({"name": property_name, "value": label})
+        name = _safe_text(raw.get("name") or raw.get("title"), 160) or " ".join(labels)
+        if stock is None or not price or not name:
+            raise ShopSyncError("platform_error", "多规格商品信息不完整，请稍后重试")
+        seen.add(sku_id)
+        skus.append({
+            "sku_id": sku_id,
+            "name": name[:160],
+            "price": price,
+            "stock": stock,
+            "properties": properties,
+        })
+
+    quantity = _sku_quantity(item.get("quantity"))
+    if quantity is None:
+        quantity = sum(sku["stock"] for sku in skus)
+    return {"quantity": quantity, "skus": skus}
+
+
 def _atomic_json(path: str, payload: dict) -> None:
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=".shop-sync-", dir=os.path.dirname(path))
@@ -716,7 +797,40 @@ def _classify_response(raw) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _signing_token_expired(payload: dict) -> bool:
+    if not isinstance(payload, dict) or _response_failure_code(payload) != "cookie_expired":
+        return False
+    values = payload.get("ret", [])
+    if isinstance(values, str):
+        values = [values]
+    return bool(
+        isinstance(values, (list, tuple)) and values
+        and all(
+            isinstance(value, str)
+            and value.partition("::")[0].strip().upper().startswith(
+                ("FAIL_SYS_TOKEN_EX", "FAIL_SYS_TOKEN_EMPTY")
+            )
+            for value in values
+        )
+    )
+
+
 def _request(cookie_header: str, cookies: dict[str, str], api: str, data: dict, spm_cnt: str) -> dict:
+    """Retry once only when MTOP supplies a replacement signing token."""
+    for attempt in range(2):
+        previous_token = cookies.get("_m_h5_tk", "")
+        current_header = "; ".join(f"{name}={value}" for name, value in cookies.items())
+        result = _request_once(current_header, cookies, api, data, spm_cnt)
+        if (
+            attempt == 1
+            or not _signing_token_expired(result)
+            or cookies.get("_m_h5_tk", "") == previous_token
+        ):
+            return result
+    return result
+
+
+def _request_once(cookie_header: str, cookies: dict[str, str], api: str, data: dict, spm_cnt: str) -> dict:
     global _last_request_at
     check_sync_circuit()
 
@@ -764,10 +878,24 @@ def _request(cookie_header: str, cookies: dict[str, str], api: str, data: dict, 
                 time.sleep(remaining)
             with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
                 raw_body = response.read(MAX_RESPONSE_BYTES + 1)
+                response_cookies = http.cookiejar.CookieJar()
+                response_cookies.extract_cookies(response, request)
             _last_request_at = time.monotonic()
         if len(raw_body) > MAX_RESPONSE_BYTES:
             raise ShopSyncError("platform_error", "闲鱼返回数据过大，请稍后重试")
-        return json.loads(raw_body.decode("utf-8"))
+        payload = json.loads(raw_body.decode("utf-8"))
+        # Keep renewed MTOP tokens only in this sync's memory. The saved login
+        # baseline and other account cookies remain owned by the login flow.
+        for cookie in response_cookies:
+            if (
+                cookie.name in {"_m_h5_tk", "_m_h5_tk_enc"}
+                and cookie.value
+                and len(cookie.value) <= 8192
+                and cookie.value.isascii()
+                and not any(character in cookie.value for character in "\r\n;")
+            ):
+                cookies[cookie.name] = cookie.value
+        return payload
     except ShopSyncError:
         raise
     except urllib.error.HTTPError as error:
@@ -845,6 +973,13 @@ def sync_shop(cookie_header: str, request_func=None) -> dict:
                 card = candidate.get("cardData", candidate) if isinstance(candidate, dict) else None
                 product = extract_product(card, synced_at)
                 if product and product["id"] not in seen:
+                    if _card_requires_sku(card):
+                        if time.monotonic() - started_at >= SYNC_MAX_SECONDS:
+                            raise ShopSyncError("sync_timeout", "店铺商品较多，同步超时，请稍后重试")
+                        detail = _classify_response(
+                            call(PRODUCT_DETAIL_API, {"itemId": product["id"]}, "a21ybx.im.0.0")
+                        )
+                        product.update(extract_sku_details(detail, product["id"]))
                     seen.add(product["id"])
                     items.append(product)
                     if len(items) >= MAX_ITEMS:

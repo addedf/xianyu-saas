@@ -129,8 +129,95 @@ def classification_contract():
     assert "verification_required" in shop_sync.PERSISTED_SYNC_CODES
 
 
+def sku_contract():
+    calls = []
+    raw_skus = [
+        {
+            "skuId": 6313001343595 + index,
+            "price": cents,
+            "priceInCent": cents,
+            "quantity": 3,
+            "propertyList": [{
+                "propertyText": "额度",
+                "valueText": f"{amount}美元额度（USD）",
+            }],
+        }
+        for index, (amount, cents) in enumerate(
+            ((5, 3690), (10, 7370), (20, 14740), (50, 36850), (100, 73700))
+        )
+    ]
+
+    def fake_request(api, data, _spm):
+        calls.append(api)
+        if api == shop_sync.PROFILE_API:
+            return success({"nick": "多规格店铺"})
+        if api == shop_sync.PRODUCTS_API:
+            return success({
+                "cardList": [
+                    {"cardData": {
+                        "id": "1093026289797",
+                        "title": "多规格礼品卡",
+                        "priceInfo": {"price": "36.90"},
+                        "itemStatus": 0,
+                        "detailParams": {"isSKU": "1"},
+                    }},
+                    {"cardData": {
+                        "id": "100001",
+                        "title": "普通商品",
+                        "priceInfo": {"price": "5.00"},
+                        "itemStatus": 0,
+                    }},
+                ],
+                "nextPage": False,
+            })
+        assert api == shop_sync.PRODUCT_DETAIL_API
+        assert data == {"itemId": "1093026289797"}
+        return success({
+            "itemDO": {
+                "itemId": 1093026289797,
+                "quantity": 15,
+                "skuList": raw_skus,
+            }
+        })
+
+    result = shop_sync.sync_shop(
+        "unb=123456; _m_h5_tk=token-value_abc",
+        request_func=fake_request,
+    )
+    assert calls == [
+        shop_sync.PROFILE_API,
+        shop_sync.PRODUCTS_API,
+        shop_sync.PRODUCT_DETAIL_API,
+    ]
+    product = result["products"][0]
+    assert product["quantity"] == 15
+    assert [sku["name"] for sku in product["skus"]] == [
+        f"{amount}美元额度（USD）" for amount in (5, 10, 20, 50, 100)
+    ]
+    assert [sku["price"] for sku in product["skus"]] == [
+        "36.90", "73.70", "147.40", "368.50", "737.00"
+    ]
+    assert [sku["stock"] for sku in product["skus"]] == [3] * 5
+    assert product["skus"][0]["sku_id"] == "6313001343595"
+    assert product["skus"][0]["properties"] == [{"name": "额度", "value": "5美元额度（USD）"}]
+    assert "skus" not in result["products"][1]
+
+    invalid = dict(raw_skus[0])
+    invalid["skuId"] = raw_skus[0]["skuId"]
+    try:
+        shop_sync.extract_sku_details(
+            {"itemDO": {"itemId": "1093026289797", "skuList": [raw_skus[0], invalid]}},
+            "1093026289797",
+        )
+    except shop_sync.ShopSyncError as error:
+        assert error.code == "platform_error"
+    else:
+        raise AssertionError("duplicate SKU IDs must fail closed")
+
+
 def main():
     classification_contract()
+    sku_contract()
     calls = []
 
     def fake_request(api, data, spm):

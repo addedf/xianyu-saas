@@ -45,8 +45,12 @@ def snapshot(cookie: str) -> dict:
             {"id": "100001", "title": "商品一", "description": "一", "price": 1, "status": "在售"},
             {"id": "100002", "title": "商品二", "description": "二", "price": 2, "status": "在售"},
             {"id": "100003", "title": "商品三", "description": "三", "price": 3, "status": "在售"},
+            {"id": "100004", "title": "多规格商品", "description": "四", "price": 4, "status": "在售", "quantity": 3, "skus": [
+                {"sku_id": "5001", "name": "5美元", "price": "36.90", "stock": 2},
+                {"sku_id": "5002", "name": "10美元", "price": "73.70", "stock": 1},
+            ]},
         ],
-        "product_count": 3,
+        "product_count": 4,
         "synced_at": "2026-08-18T10:00:00+0800",
         "truncated": False,
     }
@@ -89,6 +93,12 @@ def main() -> None:
         user_id,
         "products_config.json",
         json.dumps({"version": 1, "types": []}),
+        "default",
+    )
+    app.write_secret(
+        user_id,
+        "card_pools.json",
+        json.dumps({"version": 1, "pools": [{"id": "redeem", "name": "兑换码池", "note": ""}]}),
         "default",
     )
 
@@ -333,6 +343,42 @@ def main() -> None:
     assert bad.status_code == 400, bad.text
     assert "商品" in bad.json()["detail"]
 
+    def save_sku_template(name, sku_id, item_ids=None):
+        return client.put("/api/bot/templates", json={"template": {
+            "name": name,
+            "description": "按规格自动发货",
+            "delivery": "redeem",
+            "card_pool_id": "redeem",
+            "item_ids": item_ids or ["100004"],
+            "sku_id": sku_id,
+        }})
+
+    sku_five = save_sku_template("5美元规格", "5001")
+    assert sku_five.status_code == 200, sku_five.text
+    assert sku_five.json()["template"]["sku_id"] == "5001"
+    partial_status = client.get("/api/bot/products/delivery-status").json()
+    assert next(row for row in partial_status["items"] if row["item_id"] == "100004")["configured"] is False
+    sku_ten = save_sku_template("10美元规格", "5002")
+    assert sku_ten.status_code == 200, sku_ten.text
+    assert sku_ten.json()["template"]["item_ids"] == ["100004"]
+    assert save_sku_template("重复规格", "5001").status_code == 400
+    assert save_sku_template("不存在的规格", "5003").status_code == 400
+    assert save_sku_template("规格不能绑定多个商品", "5001", ["100004", "100001"]).status_code == 400
+    mixed_scope = client.put("/api/bot/templates", json={"template": {
+        "name": "整商品与规格不得混用",
+        "delivery": "redeem",
+        "item_ids": ["100004"],
+    }})
+    assert mixed_scope.status_code == 400, mixed_scope.text
+    delivery_status = client.get("/api/bot/products/delivery-status")
+    assert delivery_status.status_code == 200, delivery_status.text
+    status_payload = delivery_status.json()
+    sku_status = {(row["item_id"], row["sku_id"]): row for row in status_payload["sku_items"]}
+    assert sku_status[("100004", "5001")]["delivery"] == "redeem"
+    assert sku_status[("100004", "5002")]["delivery"] == "redeem"
+    assert next(row for row in status_payload["items"] if row["item_id"] == "100004")["delivery"] == "sku"
+    assert next(row for row in status_payload["items"] if row["item_id"] == "100004")["configured"] is True
+
     # DELETE removes an existing template and returns ok.
     deleted = client.delete(f"/api/bot/templates/{pan_template['id']}")
     assert deleted.status_code == 200, deleted.text
@@ -346,20 +392,24 @@ def main() -> None:
     missing = client.delete(f"/api/bot/templates/{pan_template['id']}")
     assert missing.status_code == 404, missing.text
 
-    # Card pool starts empty when the file does not exist.
+    # The explicitly created pool starts with no inventory.
     cards_empty = client.get("/api/bot/cards")
     assert cards_empty.status_code == 200, cards_empty.text
+    empty_pool = {
+        "id": "redeem",
+        "name": "兑换码池",
+        "note": "",
+        "total": 0,
+        "available": 0,
+        "reserved": 0,
+        "used": 0,
+        "quarantined": 0,
+        "enabled": True,
+    }
     assert cards_empty.json() == {
-        "pool": {
-            "id": "redeem",
-            "name": "兑换码池",
-            "note": "",
-            "total": 0,
-            "available": 0,
-            "used": 0,
-            "enabled": True,
-        },
-        "stats": {"pools": 1, "total": 0, "available": 0, "reserved": 0, "used": 0},
+        "pools": [empty_pool],
+        "pool": empty_pool,
+        "stats": {"pools": 1, "total": 0, "available": 0, "reserved": 0, "used": 0, "quarantined": 0},
     }
 
     # PUT cards writes a deduplicated pool and returns current stats.
@@ -389,6 +439,7 @@ def main() -> None:
         "available": 0,
         "reserved": 0,
         "used": 2,
+        "quarantined": 0,
     }
     stored_codes = read_codes(user_id)
     assert len(stored_codes) == 2
@@ -458,6 +509,20 @@ def main() -> None:
     assert free_templates.status_code == 200, free_templates.text
     free_cards = client.get("/api/bot/cards")
     assert free_cards.status_code == 200, free_cards.text
+
+    # The legacy bulk endpoint must obey the same SKU scope validation.
+    document_before_bulk = read_products_config(user_id)
+    bulk_types = [{"id": "bulk-" + sku, "item_ids": ["100004"], "sku_id": sku,
+                   "delivery": "redeem", "card_pool_id": "redeem"} for sku in ("5001", "5002")]
+    bulk = client.put("/api/bot/products", json={"products": {"types": bulk_types}})
+    assert bulk.status_code == 200, bulk.text
+    assert [row["sku_id"] for row in read_products_config(user_id)["types"]] == ["5001", "5002"]
+    for invalid_types in (bulk_types + [bulk_types[0]],
+                          bulk_types + [{"item_ids": ["100004"], "delivery": "redeem"}],
+                          [{**bulk_types[0], "sku_id": "9999"}]):
+        rejected = client.put("/api/bot/products", json={"products": {"types": invalid_types}})
+        assert rejected.status_code == 400, rejected.text
+    app.write_secret(user_id, "products_config.json", json.dumps(document_before_bulk), "default")
 
     del default_root
     print("templates-cards contract: templates CRUD, card pool stats, scoped validation and free permission passed")

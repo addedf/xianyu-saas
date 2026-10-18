@@ -4,7 +4,7 @@
 
   const API_PREFIX = "/xianyu-saas";
   const QR_LOGIN_POLL_MS = 1500;
-  const ASSET_VERSION = "20261003-01";
+  const ASSET_VERSION = "20261019-01";
   const AI_TEXT_PLACEHOLDERS = new Set(["无", "暂无", "没有", "未填写", "待填写", "待补充", "占位", "n/a", "na", "none", "null", "todo", "tbd"]);
   const ICONS = API_PREFIX + "/assets/icons.svg?v=" + ASSET_VERSION + "#";
   // 旧版视图 key → 新版视图 key（历史会话/书签兜底）。
@@ -3447,6 +3447,7 @@
       state.deliveryStatus = {
         available: data?.available === true,
         items: new Map(items.map((it) => [String(it.item_id), it])),
+        skuItems: new Map((Array.isArray(data?.sku_items) ? data.sku_items : []).map((it) => [String(it.item_id) + ":" + String(it.sku_id), it])),
         loaded: true,
         error: null,
       };
@@ -3525,6 +3526,10 @@
   }
 
   function renderProductDeliveryBadge(info) {
+    if (info.delivery === "sku") {
+      return '<span class="badge ' + (info.configured && info.enabled ? "badge-green" : "badge-amber") + '">' +
+        (info.configured ? (!info.enabled ? "存在暂停规格" : state.bot?.running ? "按规格自动发货" : "规格已配置 · 服务未启动") : "规格待配置") + '</span>';
+    }
     if (info.configured && info.enabled && info.delivery !== "conflict" && !state.bot?.running) {
       return '<span class="badge badge-amber">自动发货未启动</span>';
     }
@@ -3553,7 +3558,7 @@
   }
 
   function renderProductActions(product, itemId, info) {
-    if (info.delivery === "pan" || info.delivery === "redeem") {
+    if (info.delivery === "sku" || Array.isArray(product.skus) && product.skus.length || info.delivery === "pan" || info.delivery === "redeem") {
       return '<button class="button button-secondary button-compact" type="button" data-view="templates" aria-label="查看' + esc(product.title || "未命名商品") + '的发货模板"><span>查看发货模板</span></button>';
     }
     if (info.delivery === "conflict") {
@@ -3564,6 +3569,17 @@
         '<button class="button button-secondary button-compact" type="button" data-delivery-toggle="' + esc(itemId) + '" aria-label="' + (info.enabled ? "暂停" : "恢复") + esc(product.title || "未命名商品") + '的资料"><span>' + (info.enabled ? "暂停资料" : "恢复资料") + "</span></button>";
     }
     return '<button class="button button-secondary button-compact" type="button" data-edit-delivery data-item-id="' + esc(itemId) + '" aria-label="编辑' + esc(product.title || "未命名商品") + '的资料"><span>编辑资料</span></button>';
+  }
+
+  function renderProductSkus(product) {
+    const skus = Array.isArray(product.skus) ? product.skus : [];
+    if (!skus.length) return "";
+    return '<details class="product-skus" open><summary>' + skus.length + ' 个规格 · 平台库存 ' + esc(product.quantity ?? "—") + '</summary>' +
+      '<div class="product-sku-scroll"><table><thead><tr><th>规格</th><th>售价</th><th>平台库存</th><th>发货模板</th></tr></thead><tbody>' + skus.map((sku) => {
+        const binding = state.deliveryStatus?.skuItems?.get(String(product.id) + ":" + String(sku.sku_id));
+        const label = !binding ? "待绑定" : !binding.configured ? "待完善" : binding.enabled ? "已绑定" : "已暂停";
+        return '<tr><td title="SKU ' + esc(sku.sku_id) + '">' + esc(sku.name) + '</td><td>¥' + esc(sku.price) + '</td><td>' + esc(sku.stock) + '</td><td>' + esc(label) + '</td></tr>';
+      }).join("") + '</tbody></table></div></details>';
   }
 
   function renderProducts() {
@@ -3728,7 +3744,7 @@
             '<small class="product-desc">' + esc(product.description || "暂无商品简介") + "</small></div></div>" +
             '<span class="product-price">' + esc(product.price_display || "价格待同步") + "</span>" +
             badge +
-            '<div class="product-actions">' + actions + "</div>" +
+            '<div class="product-actions">' + actions + "</div>" + renderProductSkus(product) +
             "</div>";
         }).join("");
       }
@@ -3756,7 +3772,7 @@
             '<span class="product-card-price">' + esc(product.price_display || "价格待同步") + "</span>" +
             badge +
             "</div>" +
-            '<div class="product-card-actions">' + actions + "</div>" +
+            renderProductSkus(product) + '<div class="product-card-actions">' + actions + "</div>" +
             "</div>" +
             "</div>";
         }).join("");
@@ -3832,6 +3848,7 @@
         '<div><strong>绑定卡密池</strong><span>' + esc(poolLine) + "</span></div>" +
         '<div><strong>发货话术</strong><span class="template-card-preview">' + esc(script) + "</span></div>" +
         '<div><strong>绑定商品</strong><span class="template-card-products">' + (chips || '<span class="template-card-product-chip">未绑定商品</span>') + "</span></div>" +
+        (template.sku_id ? '<div><strong>绑定规格</strong><span>' + esc(state.products.find((product) => itemIds.includes(String(product.id)))?.skus?.find((sku) => String(sku.sku_id) === String(template.sku_id))?.name || "SKU " + template.sku_id) + '</span></div>' : "") +
         "</div>" +
         '<div class="template-card-actions">' +
         '<button class="button button-secondary button-compact" type="button" data-template-edit="' + esc(id) + '"><svg class="icon"><use href="' + ICONS + 'edit-3"></use></svg><span>编辑</span></button>' +
@@ -3995,6 +4012,8 @@
       productIds: editing ? (Array.isArray(template.item_ids) ? template.item_ids.map(String) : []) : [],
       resourceMatch: editing && Array.isArray(template.resource_match) ? template.resource_match.map(String) : [],
       delivery: deliveryInfo.delivery,
+      skuId: String(template?.sku_id || ""),
+      enabled: template?.enabled !== false,
     };
     text("#templateEditorTitle", editing ? "编辑发货模板" : "创建发货模板");
     const deliveryTypeInput = $("#templateDeliveryTypeInput");
@@ -4028,10 +4047,29 @@
         }).join("");
       }
     }
+    renderTemplateSkuSelect();
     formMessage("#templateEditorMessage", "");
     const dialog = $("#templateEditorDialog");
     if (typeof dialog.showModal === "function") dialog.showModal();
     else dialog.setAttribute("open", "");
+  }
+
+  function renderTemplateSkuSelect() {
+    const select = $("#templateSkuSelect");
+    const field = $("#templateSkuField");
+    if (!select || !field) return;
+    const itemIds = reconcileTemplateItemSelection();
+    const product = itemIds.length === 1 ? state.products.find((item) => String(item.id) === itemIds[0]) : null;
+    const skus = Array.isArray(product?.skus) ? product.skus : [];
+    const selected = String(state.templateEditor?.skuId || "");
+    field.hidden = !skus.length && !selected;
+    select.innerHTML = '<option value="">请选择发货规格</option>' + skus.map((sku) =>
+      '<option value="' + esc(sku.sku_id) + '">' + esc(sku.name) + ' · ¥' + esc(sku.price) + ' · 平台库存 ' + esc(sku.stock) + '</option>'
+    ).join("");
+    if (selected && !skus.some((sku) => String(sku.sku_id) === selected)) {
+      select.innerHTML += '<option value="' + esc(selected) + '" disabled>原规格不可用，请重新选择商品和规格</option>';
+    }
+    select.value = selected;
   }
 
   function reconcileTemplateItemSelection() {
@@ -4067,8 +4105,14 @@
       price,
       delivery,
       item_ids: itemIds,
-      enabled: true,
+      enabled: state.templateEditor?.enabled !== false,
     };
+    const skuId = String($("#templateSkuSelect")?.value || "");
+    const skuProducts = state.products.filter((product) => itemIds.includes(String(product.id)) && product.skus?.length);
+    if (skuProducts.length && (itemIds.length !== 1 || !skuId)) {
+      return { valid: false, error: "多规格模板请只选一个商品，并选择对应规格", template };
+    }
+    if (skuId) template.sku_id = skuId;
     if (delivery === "pan") {
       const existingTags = Array.isArray(state.templateEditor?.resourceMatch) ? state.templateEditor.resourceMatch.filter(Boolean) : [];
       template.resource_match = existingTags.length ? existingTags : [name];
@@ -5788,8 +5832,8 @@
     const statusBadges = { delivered: "badge-green", manual_review: "badge-amber", retry: "badge-blue", failed: "badge-red", queued: "badge-muted", processing: "badge-blue", sent: "badge-green" };
     homeList.innerHTML = orders.map((order) => {
       const status = String(order.status || "queued");
-      const badge = statusBadges[status] || "badge-muted";
-      const label = statusLabels[status] || status;
+      const badge = order.review_status === "resolved" ? "badge-muted" : (statusBadges[status] || "badge-muted");
+      const label = order.status_label || statusLabels[status] || status;
       const buyer = esc(order.buyer_nick || order.buyer || "--");
       const itemTitle = esc(order.title || order.item_title || order.item_id || "--");
       const price = esc(order.paid_amount ? "¥" + order.paid_amount : (order.price_display || (order.amount ? "¥" + order.amount : "--")));
@@ -5995,6 +6039,9 @@
       { label: "内部记录号", value: order.order_key || "--" },
       { label: "商品ID", value: order.item_id || "--" },
       { label: "商品标题", value: order.item_title || "--" },
+      { label: "购买规格", value: order.sku_name || "--" },
+      { label: "SKU ID", value: order.sku_id || "--" },
+      { label: "卡密池", value: order.card_pool_id || "--" },
       { label: "买家ID", value: order.buyer_id || "--" },
       { label: "会话ID", value: order.chat_id || "--" },
       { label: "履约方式", value: order.delivery_type_label || order.delivery_type || "--" },
@@ -6045,6 +6092,7 @@
           orderProductThumb(order) +
           '<div class="orders-product-info">' +
             '<span class="orders-product-title" title="' + esc(productTitle) + '">' + esc(productTitle) + '</span>' +
+            (order.sku_id ? '<small>' + esc(order.sku_name || "SKU " + order.sku_id) + '</small>' : "") +
             (order.item_id ? '<small class="orders-product-id">ID: ' + esc(order.item_id) + '</small>' : "") +
           '</div>' +
         '</div>' +
@@ -10473,6 +10521,13 @@
     $("#createTemplateButton").addEventListener("click", () => { void openTemplateEditor(); });
     $("#templatesEmptyAction").addEventListener("click", () => { void openTemplateEditor(); });
     $("#templateEditorForm").addEventListener("submit", saveTemplate);
+    $("#templateProductPicker").addEventListener("change", () => {
+      state.templateEditor.skuId = "";
+      renderTemplateSkuSelect();
+    });
+    $("#templateSkuSelect").addEventListener("change", (event) => {
+      state.templateEditor.skuId = event.currentTarget.value;
+    });
     $("#templateCardPoolSelect").addEventListener("change", (event) => {
       const deliveryTypeInput = $("#templateDeliveryTypeInput");
       if (deliveryTypeInput) deliveryTypeInput.value = event.currentTarget.value ? "redeem" : "pan";

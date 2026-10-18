@@ -56,6 +56,7 @@ class FakeApi:
         self.order_seller = True
         self.order_status = 2
         self.order_quantity = 1
+        self.order_sku_id = None
         self.paid_amount = "5.00"
         self.head_error = None
         self.detail_error = None
@@ -141,7 +142,7 @@ class FakeApi:
                     {
                         "render": "orderInfoVO",
                         "data": {
-                            "itemInfo": {"buyAmount": self.order_quantity},
+                            "itemInfo": {"buyAmount": self.order_quantity, "skuId": self.order_sku_id},
                             "priceInfo": {
                                 "amount": {"value": self.paid_amount}
                             },

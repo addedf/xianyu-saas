@@ -148,7 +148,7 @@
 
 @font-face {
   font-family: "Whale UI";
-  src: url("/xianyu-saas/assets/ui-sans-generated.woff2?v=20261003-01") format("woff2");
+  src: url("/xianyu-saas/assets/ui-sans-generated.woff2?v=20261019-01") format("woff2");
   font-style: normal;
   font-weight: 100 900;
   font-display: swap;
@@ -4152,3 +4152,15 @@ select { min-height: 34px; padding: 6px 8px; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
+/* Variant inventory is shown independently from the private card pool. */
+.product-skus { margin: 12px 0; min-width: 0; max-width: 100%; font-size: 12px; }
+.product-skus summary { cursor: pointer; color: var(--text-secondary, #64748b); }
+.product-sku-scroll { max-width: 100%; overflow-x: auto; margin-top: 8px; }
+.product-skus table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.product-skus th, .product-skus td { padding: 6px 4px; text-align: left; white-space: nowrap; }
+.product-skus th { font-weight: 500; color: var(--text-secondary, #64748b); }
+.product-row > .product-skus { grid-column: 1 / -1; width: 100%; }
+.template-editor-dialog { max-height: 90dvh; overflow: hidden; }
+.template-editor-dialog > form { display: flex; flex-direction: column; max-height: 90dvh; }
+.template-editor-dialog .dialog-head, .template-editor-dialog .dialog-actions { flex-shrink: 0; }
+.template-editor-dialog .template-editor-body { min-height: 0; overflow-y: auto; }

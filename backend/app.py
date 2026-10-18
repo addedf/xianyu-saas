@@ -36,6 +36,7 @@ from access import account_payload, has_permission, is_platform_admin, plan_for
 from account_storage import AccountStorage, AccountStorageError, AccountStorageRecoveryError, DEFAULT_ACCOUNT_ID, normalize_account_key
 from account_leases import AccountLease, AccountLeaseError, acquire_account_lease
 from fulfillment_config import (
+    template_sku_id, snapshot_contains_sku,
     FulfillmentConfig, FulfillmentConfigError,
     card_pool_id,
     normalise_template_input, normalise_template_item_ids, template_public,
@@ -1551,6 +1552,7 @@ class TemplateItemIn(BaseModel):
     price: str | None = None
     delivery: str = ""
     item_ids: list | None = None
+    sku_id: str | None = None
     resource_match: list | None = None
     card_pool_id: str | None = None
     enabled: bool | None = None
@@ -4226,10 +4228,20 @@ def get_product_delivery_status(user=Depends(Auth.current_user), account=Depends
     key = str(account["account_key"])
     snapshot = load_verified_snapshot(user["id"], key)
     if snapshot is None:
-        return {"available": False, "items": []}
-    allowed = {str(item.get("id")) for item in snapshot.get("products", []) if isinstance(item, dict)}
+        return {"available": False, "items": [], "sku_items": []}
+    products = [item for item in snapshot.get("products", []) if isinstance(item, dict)]
+    allowed = {str(item.get("id")) for item in products}
+    allowed_skus = {
+        str(item.get("id")): {
+            str(sku.get("sku_id"))
+            for sku in (item.get("skus") if isinstance(item.get("skus"), list) else [])
+            if isinstance(sku, dict) and sku.get("sku_id") is not None
+        }
+        for item in products
+    }
     document = _read_products_document(user["id"], key)
     items = {}
+    sku_items = {}
     for entry in document["types"]:
         kind = entry["delivery"]
         ids = entry.get("item_ids")
@@ -4237,21 +4249,54 @@ def get_product_delivery_status(user=Depends(Auth.current_user), account=Depends
             ids = [entry.get("item_id")]
         content = entry.get("payload", entry.get("material"))
         configured = bool(isinstance(content, str) and content.strip()) if kind == "material" else bool(entry.get("resource_match")) if kind == "pan" else True
+        sku_id = str(entry.get("sku_id") or "")
+        template_id = entry.get("id")
+        template_id = str(template_id) if isinstance(template_id, (str, int)) and not isinstance(template_id, bool) else None
+        if template_id is not None and (not 1 <= len(template_id) <= 120 or any(ord(char) < 32 for char in template_id)):
+            template_id = None
         for raw_id in ids:
             item_id = str(raw_id)
             if item_id not in allowed:
+                continue
+            if sku_id:
+                if sku_id not in allowed_skus.get(item_id, set()):
+                    continue
+                sku_key = (item_id, sku_id)
+                if sku_key in sku_items:
+                    sku_items[sku_key] = {"item_id": item_id, "sku_id": sku_id, "delivery": "conflict",
+                        "configured": False, "enabled": False, "template_id": None}
+                    items[item_id] = {"item_id": item_id, "delivery": "conflict", "configured": False,
+                        "enabled": False, "template_id": None}
+                    continue
+                sku_items[sku_key] = {"item_id": item_id, "sku_id": sku_id, "delivery": kind,
+                    "configured": configured, "enabled": entry.get("enabled", True),
+                    "template_id": template_id if kind in {"pan", "redeem"} else None}
+                current = items.get(item_id)
+                if current is not None and current.get("delivery") != "sku":
+                    items[item_id] = {"item_id": item_id, "delivery": "conflict", "configured": False,
+                        "enabled": False, "template_id": None}
+                else:
+                    items[item_id] = {"item_id": item_id, "delivery": "sku",
+                        "configured": configured and (current is None or current.get("configured", False)),
+                        "enabled": entry.get("enabled", True) or bool(current and current.get("enabled")),
+                        "template_id": None}
                 continue
             if item_id in items:
                 items[item_id] = {"item_id": item_id, "delivery": "conflict", "configured": False,
                                   "enabled": False, "template_id": None}
                 continue
-            template_id = entry.get("id")
-            template_id = str(template_id) if isinstance(template_id, (str, int)) and not isinstance(template_id, bool) else None
-            if template_id is not None and (not 1 <= len(template_id) <= 120 or any(ord(char) < 32 for char in template_id)):
-                template_id = None
             items[item_id] = {"item_id": item_id, "delivery": kind, "configured": configured,
                 "enabled": entry.get("enabled", True), "template_id": template_id if kind in {"pan", "redeem"} else None}
-    return {"available": True, "items": list(items.values())}
+    for item_id, required_skus in allowed_skus.items():
+        if not required_skus or items.get(item_id, {}).get("delivery") == "conflict":
+            continue
+        bindings = [sku_items.get((item_id, sku_id)) for sku_id in required_skus]
+        items[item_id] = {
+            "item_id": item_id, "delivery": "sku", "template_id": None,
+            "configured": all(row and row["configured"] for row in bindings),
+            "enabled": all(row and row["enabled"] for row in bindings),
+        }
+    return {"available": True, "items": list(items.values()), "sku_items": list(sku_items.values())}
 
 
 @app.get("/api/bot/products")
@@ -5365,7 +5410,7 @@ def _save_products_locked(body: ProductsIn, user, account, lease=None):
     if len(types) > 500:
         raise HTTPException(400, "商品类型过多")
     normalized_types = []
-    seen_item_ids = set()
+    seen_item_ids = {}
     snapshot = load_verified_snapshot(user["id"], account_key)
     snapshot_ids = {
         str(item.get("id"))
@@ -5377,6 +5422,10 @@ def _save_products_locked(body: ProductsIn, user, account, lease=None):
         if not isinstance(raw_item, dict) or raw_item.get("delivery") not in {"redeem", "pan"}:
             raise HTTPException(400, "type 配置无效(delivery 只能是 redeem/pan)")
         item = dict(raw_item)
+        try:
+            sku_id = template_sku_id(item)
+        except FulfillmentConfigError as error:
+            raise HTTPException(error.status_code, str(error)) from error
         item_ids = item.get("item_ids")
         if not isinstance(item_ids, list):
             single_item_id = item.get("item_id")
@@ -5391,12 +5440,19 @@ def _save_products_locked(body: ProductsIn, user, account, lease=None):
                 raise HTTPException(400, "商品配置必须使用有效的数字商品 ID")
             if item_key not in snapshot_ids:
                 raise HTTPException(400, "商品配置只能绑定当前店铺已识别的商品")
-            if item_key in seen_item_ids:
-                raise HTTPException(400, "同一个商品不能重复配置")
-            seen_item_ids.add(item_key)
+            scopes = seen_item_ids.setdefault(item_key, set())
+            if scopes and (not sku_id or "" in scopes or sku_id in scopes):
+                raise HTTPException(400, "同一个商品或 SKU 不能重复配置")
+            scopes.add(sku_id)
             clean_ids.append(item_key)
         if not clean_ids:
             raise HTTPException(400, "每个商品类型至少需要一个商品 ID")
+        if sku_id and (len(clean_ids) != 1 or not snapshot_contains_sku(snapshot, clean_ids[0], sku_id)):
+            raise HTTPException(400, "SKU 配置只能绑定当前商品的一个有效规格")
+        if sku_id:
+            item["sku_id"] = sku_id
+        else:
+            item.pop("sku_id", None)
         item["item_ids"] = clean_ids
         item.pop("item_id", None)
         if item["delivery"] == "pan":

@@ -2159,6 +2159,9 @@ _ORDER_STATUS_LABELS = {
     "expired": "记录已过期", "failed": "发送失败",
 }
 _ORDER_REASONS = {
+    "sku_unavailable": "订单规格未能确认，请核对 SKU 后处理",
+    "unsupported_sku": "订单规格尚未绑定有效模板，请按 SKU 配置",
+    "order_sku_mismatch": "订单规格与原预占记录不一致，已暂停发货",
     "inventory_empty": "库存不足，请核对后处理",
     "inventory_marked_used": "关联库存已使用", "inventory_removed_from_manifest": "关联库存已移除",
     "card_pool_changed": "商品绑定的卡密池已变化，请核对原预占卡密后处理",
@@ -2182,7 +2185,7 @@ _ORDER_RESOLUTIONS = {
 _ORDER_FIELDS = (
     "order_key", "status", "item_id", "quantity", "platform_order_id", "buyer_id", "chat_id",
     "paid_amount", "created_at", "updated_at", "verified_at", "delivered_at",
-    "platform_shipped_at", "platform_status", "delivery_type", "last_error",
+    "platform_shipped_at", "platform_status", "delivery_type", "last_error", "sku_id", "pool_id",
 )
 
 
@@ -2353,6 +2356,9 @@ def _order_payload(row, product_map, chat_ids):
     payload = {
         "order_key": str(row["order_key"] or ""), "platform_order_id": str(row["platform_order_id"] or ""),
         "item_id": str(row["item_id"] or ""), "item_title": str(product.get("title") or "")[:400],
+        "sku_id": str(row["sku_id"] or ""), "card_pool_id": str(row["pool_id"] or ""),
+        "sku_name": next((str(sku.get("name") or "")[:160] for sku in product.get("skus", [])
+                          if isinstance(sku, dict) and str(sku.get("sku_id")) == str(row["sku_id"])), ""),
         "item_image_url": image, "buyer_id": str(row["buyer_id"] or ""), "chat_id": str(row["chat_id"] or ""),
         "conversation_available": str(row["chat_id"] or "") in chat_ids,
         "quantity": row["quantity"] if isinstance(row["quantity"], int) and row["quantity"] >= 0 else None,

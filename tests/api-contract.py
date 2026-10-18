@@ -891,6 +891,10 @@ def main():
     saved_products = json.loads((tenant_dir / "products_config.json").read_text())
     assert saved_products["types"][0]["delivery"] == "material"
     assert saved_products["types"][0]["payload"].startswith("使用说明")
+    # Redeem bindings require a real account-local pool before templates exist.
+    app.write_secret(automation_user["id"], "card_pools.json",
+                     json.dumps({"version": 1, "pools": [{"id": "redeem", "name": "合同卡密池", "note": ""}]}),
+                     "default")
     products_payload = {
         "types": [
             {

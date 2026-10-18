@@ -22,6 +22,17 @@ def normalize_card_pool_id(value):
     return value
 
 
+def normalize_sku_id(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError("SKU ID is invalid")
+    text = str(value).strip()
+    if not text or len(text) > 64 or not text.isascii() or not text.isdigit():
+        raise ValueError("SKU ID is invalid")
+    return text
+
+
 @dataclass(frozen=True)
 class DeliveryReservation:
     key: str
@@ -39,6 +50,7 @@ class DeliveryReservation:
     platform_status: Optional[str] = None
     paid_amount: Optional[str] = None
     pool_id: str = "redeem"
+    sku_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,9 @@ class DeliveryStore:
             "order_not_awaiting_shipment",
             "unsupported_quantity",
             "order_reverification_failed",
+            "sku_unavailable",
+            "unsupported_sku",
+            "order_sku_mismatch",
             "pan_resource_unavailable",
             "material_payload_unavailable",
             "inventory_empty",
@@ -211,6 +226,7 @@ class DeliveryStore:
                     chat_id TEXT NOT NULL,
                     buyer_id TEXT,
                     item_id TEXT,
+                    sku_id TEXT,
                     delivery_type TEXT,
                     pool_id TEXT NOT NULL DEFAULT 'redeem',
                     delivery_payload TEXT,
@@ -319,6 +335,7 @@ class DeliveryStore:
                 ("platform_shipped_at", "REAL"),
                 ("platform_ship_attempts", "INTEGER NOT NULL DEFAULT 0"),
                 ("pool_id", "TEXT NOT NULL DEFAULT 'redeem'"),
+                ("sku_id", "TEXT"),
             ):
                 if column not in columns:
                     conn.execute(
@@ -1133,6 +1150,7 @@ class DeliveryStore:
         platform_status: str,
         paid_amount: str,
         quantity: int = 1,
+        sku_id: str | None = None,
     ) -> PaymentEvent:
         """Persist platform proof before inventory can be reserved."""
         platform_order_id = str(platform_order_id)
@@ -1153,6 +1171,7 @@ class DeliveryStore:
             raise ValueError("platform order status is invalid")
         if not paid_amount or len(paid_amount) > 64:
             raise ValueError("paid amount is invalid")
+        sku_id = normalize_sku_id(sku_id)
 
         self.record_payment_event(order_key, chat_id, event_at, ttl_seconds)
         now = self.now_fn()
@@ -1173,6 +1192,8 @@ class DeliveryStore:
                     raise DeliveryStoreError("payment event paid amount mismatch")
                 if row["quantity"] not in (None, quantity, 1) and row["status"] != "awaiting_binding":
                     raise DeliveryStoreError("payment event quantity mismatch")
+                if row["platform_order_id"] is not None and row["sku_id"] != sku_id:
+                    raise DeliveryStoreError("payment event sku mismatch")
                 next_status = (
                     "verified" if row["status"] == "awaiting_binding" else row["status"]
                 )
@@ -1180,7 +1201,7 @@ class DeliveryStore:
                     """
                     UPDATE delivery_events
                     SET platform_order_id = ?, verified_at = COALESCE(verified_at, ?),
-                        platform_status = ?, paid_amount = ?, quantity = ?,
+                        platform_status = ?, paid_amount = ?, quantity = ?, sku_id = ?,
                         status = ?, updated_at = ?
                     WHERE order_key = ?
                     """,
@@ -1190,6 +1211,7 @@ class DeliveryStore:
                         platform_status,
                         paid_amount,
                         quantity,
+                        sku_id,
                         next_status,
                         now,
                         order_key,
@@ -1502,10 +1524,12 @@ class DeliveryStore:
         quantity: int = 1,
         delivery_payload: Optional[str] = None,
         pool_id: str = "redeem",
+        sku_id: str | None = None,
     ) -> DeliveryReservation:
         if delivery_type not in {"redeem", "pan", "material"}:
             raise ValueError("unsupported delivery type")
         pool_id = normalize_card_pool_id(pool_id) if delivery_type == "redeem" else "redeem"
+        sku_id = normalize_sku_id(sku_id)
         if isinstance(quantity, bool) or not isinstance(quantity, int):
             raise ValueError("order quantity is invalid")
         if quantity < 1 or quantity > 50:
@@ -1544,6 +1568,20 @@ class DeliveryStore:
                 if row[field] not in (None, str(value)):
                     raise DeliveryStoreError(f"payment event {field} mismatch")
             if row["status"] in {"reserved", "retry", "sending"}:
+                if row["sku_id"] != sku_id:
+                    conn.execute(
+                        """UPDATE delivery_events
+                           SET status = 'manual_review', last_error = 'order_sku_mismatch',
+                               send_started_at = NULL, updated_at = ? WHERE order_key = ?""",
+                        (now, order_key),
+                    )
+                    conn.execute(
+                        "UPDATE inventory SET status = 'quarantined', updated_at = ? WHERE reservation_key = ? AND status = 'reserved'",
+                        (now, order_key),
+                    )
+                    self._upsert_manual_review(conn, order_key, "order_sku_mismatch", now)
+                    row = conn.execute("SELECT * FROM delivery_events WHERE order_key = ?", (order_key,)).fetchone()
+                    return self._reservation_from_row(conn, row)
                 if delivery_type == "redeem" and row["pool_id"] != pool_id:
                     # A retry keeps its original cards. Changing a product's
                     # pool requires manual review instead of a second allocation.
@@ -1573,6 +1611,8 @@ class DeliveryStore:
                         "SELECT * FROM delivery_events WHERE order_key = ?", (order_key,)
                     ).fetchone()
                 return self._reservation_from_row(conn, row)
+            if row["sku_id"] != sku_id:
+                raise DeliveryStoreError("payment event sku mismatch")
             if row["status"] != "verified":
                 raise DeliveryStoreError("payment event has an invalid state")
 
@@ -1591,11 +1631,11 @@ class DeliveryStore:
                     conn.execute(
                         """
                         UPDATE delivery_events
-                        SET buyer_id = ?, item_id = ?, delivery_type = ?, pool_id = ?,
+                        SET buyer_id = ?, item_id = ?, sku_id = ?, delivery_type = ?, pool_id = ?,
                             status = 'manual_review', last_error = 'inventory_empty', updated_at = ?
                         WHERE order_key = ?
                         """,
-                        (str(buyer_id), str(item_id), delivery_type, pool_id, now, order_key),
+                        (str(buyer_id), str(item_id), sku_id, delivery_type, pool_id, now, order_key),
                     )
                     self._upsert_manual_review(
                         conn, order_key, "inventory_empty", now
@@ -1620,13 +1660,14 @@ class DeliveryStore:
             conn.execute(
                 """
                 UPDATE delivery_events
-                SET buyer_id = ?, item_id = ?, delivery_type = ?, delivery_payload = ?, quantity = ?, pool_id = ?,
+                SET buyer_id = ?, item_id = ?, sku_id = ?, delivery_type = ?, delivery_payload = ?, quantity = ?, pool_id = ?,
                     status = 'reserved', inventory_ids = ?, last_error = NULL, updated_at = ?
                 WHERE order_key = ?
                 """,
                 (
                     str(buyer_id),
                     str(item_id),
+                    sku_id,
                     delivery_type,
                     delivery_payload,
                     quantity,
@@ -2073,4 +2114,5 @@ class DeliveryStore:
             platform_status=row["platform_status"],
             paid_amount=row["paid_amount"],
             pool_id=row["pool_id"],
+            sku_id=row["sku_id"],
         )

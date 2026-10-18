@@ -3440,6 +3440,67 @@ async function checkHomeAlerts(browser, baseUrl) {
   } finally { await page.close(); }
 }
 
+async function checkSkuDelivery(browser, baseUrl) {
+  const skus = [5, 10, 20, 50, 100].map((amount, index) => ({
+    sku_id: String(6000 + index), name: amount + "美元额度", price: String(amount * 7), stock: 3,
+  }));
+  fixtures.products = [{ id: "100001", title: "多面额礼品卡", price_display: "¥35", quantity: 15, skus }];
+  fixtures.templates = [];
+  fixtures.cards.pools = skus.map((sku, index) => ({ id: "pool-" + index, name: sku.name, available: 3, total: 3, used: 0 }));
+  fixtures.deliveryStatusByAccount.default = { available: true, items: [
+    { item_id: "100001", delivery: "sku", configured: false, enabled: false },
+  ], sku_items: [{ item_id: "100001", sku_id: "6000", configured: true, enabled: true, delivery: "redeem" }] };
+  const { page, evidence } = await desktopContractPage(browser, baseUrl);
+  try {
+    await desktopLogin(page, fixtures.me.username);
+    await openView(page, "goods");
+    await page.waitForSelector(".product-skus tbody tr");
+    assert.equal(await page.locator(".product-skus tbody tr").count(), 5);
+    assert.match(await page.locator(".product-skus tbody tr").first().innerText(), /已绑定/);
+    assert.match(await page.locator(".product-skus tbody tr").last().innerText(), /待绑定/);
+    assert.equal(await page.locator("#productGrid [data-edit-delivery]").count(), 0);
+    for (const width of [1440, 768, 390]) {
+      await page.setViewportSize({ width, height: 950 });
+      await assertNoOverflow(page, "SKU goods " + width);
+    }
+    await openView(page, "templates");
+    for (const [index, sku] of skus.entries()) {
+      await page.click("#createTemplateButton");
+      await page.waitForSelector("#templateEditorDialog[open]");
+      await page.fill("#templateNameInput", sku.name + "发货");
+      await page.fill("#templateDeliveryInput", "请使用对应面额的礼品卡。");
+      await page.check('[data-template-product="100001"]');
+      assert.equal(await page.locator("#templateSkuSelect option").count(), 6);
+      const requestsBefore = fixtures.templateRequests.length;
+      await page.click("#templateEditorCommit");
+      assert.match(await page.locator("#templateEditorMessage").innerText(), /规格/);
+      assert.equal(fixtures.templateRequests.length, requestsBefore);
+      await page.selectOption("#templateSkuSelect", sku.sku_id);
+      await page.selectOption("#templateCardPoolSelect", "pool-" + index);
+      const saved = page.waitForResponse((response) => response.url().endsWith("/api/bot/templates") && response.request().method() === "PUT");
+      await page.click("#templateEditorCommit");
+      assert.equal((await saved).status(), 200);
+      await page.waitForSelector("#templateEditorDialog:not([open])", { state: "attached" });
+      const body = fixtures.templateRequests.at(-1).template;
+      assert.equal(body.sku_id, sku.sku_id);
+      assert.equal(body.card_pool_id, "pool-" + index);
+      assert.deepEqual(body.item_ids, ["100001"]);
+    }
+    await page.click('[data-template-edit="tpl-3"]');
+    await page.waitForSelector("#templateEditorDialog[open]");
+    assert.equal(await page.inputValue("#templateSkuSelect"), "6002");
+    assert.equal(await page.inputValue("#templateCardPoolSelect"), "pool-2");
+    for (const width of [1440, 768, 390]) {
+      await page.setViewportSize({ width, height: 950 });
+      await assertNoOverflow(page, "SKU template editor " + width);
+      const bounds = await page.locator("#templateEditorCommit").boundingBox();
+      assert.ok(bounds && bounds.y >= 0 && bounds.y + bounds.height <= 950, "SKU template save stays within the viewport");
+    }
+    assertDesktopEvidence(evidence);
+    console.log(JSON.stringify({ ok: true, scope: "sku", cases: ["five-variant-inventory", "per-sku-binding-state", "missing-selection-blocked", "five-exact-sku-pool-submissions", "edit-preserves-sku", "1440-768-390-layout"] }));
+  } finally { await page.close(); }
+}
+
 async function checkDashboardDesktop(browser, baseUrl) {
   fixtures.bot.running = true;
   const today = { buyer_messages_total: 11, messages_total: 18, auto_replies_total: 7,
@@ -5623,6 +5684,10 @@ async function run() {
   let expectedManualReplyNotFoundConsole = 0;
   let expectedManualReplyNotFoundResponses = 0;
   try {
+    if (process.env.SAAS_UI_SCOPE === "sku") {
+      await checkSkuDelivery(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
+      return;
+    }
     if (docsCaptureScope) {
       await captureDocs(browser, `http://127.0.0.1:${port}/xianyu-saas/`);
       return;

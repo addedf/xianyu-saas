@@ -643,6 +643,7 @@ class XianyuLive:
         self.reply_rules_available = True
         self._reply_rules_signature = None
         self.products = {}
+        self.sku_products = {}
         self.pan_resources = []
         self._products_signature = None
         self._pan_resources_signature = None
@@ -1210,26 +1211,29 @@ class XianyuLive:
         if not force and signature == previous_signature:
             return
         try:
-            products = self._load_products() if config_signature is not None else {}
-            pan_resources = self._load_pan_resources(products)
+            products, sku_products = self._load_products() if config_signature is not None else ({}, {})
+            pan_resources = self._load_pan_resources({**products, **sku_products})
         except RuntimeError as exc:
             if force:
                 raise
             # Invalid or removed mappings revoke automatic delivery until a
             # valid file is written; never continue with stale authorization.
             self.products = {}
+            self.sku_products = {}
             self.pan_resources = []
             self._products_signature = config_signature
             self._pan_resources_signature = pan_signature
             logger.error("商品履约配置无效，已暂停自动发货 error={}", type(exc).__name__)
             return
         self.products = products
+        self.sku_products = sku_products
         self.pan_resources = pan_resources
         self._products_signature = config_signature
         self._pan_resources_signature = pan_signature
 
     def _refresh_redeem_inventory(self, force=False):
-        needed = any(config.get("delivery") == "redeem" for config in self.products.values())
+        needed = any(config.get("delivery") == "redeem" for config in
+                     [*self.products.values(), *getattr(self, "sku_products", {}).values()])
         path = self._state_input_path("redeem_codes.json")
         file_signature = _reply_rules_file_signature(path) if needed else None
         signature = (needed, file_signature)
@@ -1309,6 +1313,7 @@ class XianyuLive:
         if not isinstance(configs, list):
             raise RuntimeError("products_config.json 缺少 types 列表")
         by_item = {}
+        by_sku = {}
         for config in configs:
             if not isinstance(config, dict) or config.get("delivery") not in {
                 "redeem",
@@ -1324,6 +1329,10 @@ class XianyuLive:
                 # but must not authorize either replies or delivery.
                 continue
             config = dict(config)
+            raw_sku = config.get("sku_id")
+            sku_id = self._numeric_identifier(raw_sku) if raw_sku not in (None, "") else None
+            if raw_sku not in (None, "") and sku_id is None:
+                raise RuntimeError("products_config.json 包含无效 sku_id")
             if config["delivery"] == "redeem":
                 try:
                     config["card_pool_id"] = normalize_card_pool_id(config.get("card_pool_id", "redeem"))
@@ -1358,6 +1367,8 @@ class XianyuLive:
             item_ids = config.get("item_ids")
             if not isinstance(item_ids, list) or (not item_ids and config["delivery"] == "material"):
                 raise RuntimeError("自动发货商品必须配置明确 item_ids")
+            if sku_id and (len(item_ids) != 1 or config["delivery"] == "material"):
+                raise RuntimeError("SKU 模板必须绑定一个商品和有效发货类型")
             # The template API permits explicitly unbound redeem/pan drafts.
             # An empty list authorizes no item and must not load any inventory;
             # missing/invalid scopes and private material remain fail-closed.
@@ -1365,9 +1376,16 @@ class XianyuLive:
                 item_key = self._numeric_identifier(item_id.strip() if isinstance(item_id, str) else item_id)
                 if item_key is None:
                     raise RuntimeError("products_config.json 包含无效 item_id")
-                if item_key in by_item:
-                    raise RuntimeError("products_config.json 存在重复 item_id")
-                by_item[item_key] = dict(config)
+                if sku_id:
+                    if ((item_key, sku_id) in by_sku
+                            or item_key in by_item and by_item[item_key].get("delivery") != "sku"):
+                        raise RuntimeError("products_config.json 存在重复或冲突的 SKU 绑定")
+                    by_sku[(item_key, sku_id)] = dict(config, sku_id=sku_id)
+                    by_item[item_key] = {"delivery": "sku"}
+                else:
+                    if item_key in by_item:
+                        raise RuntimeError("products_config.json 存在重复 item_id")
+                    by_item[item_key] = dict(config)
             if config["delivery"] == "pan":
                 tags = config.get("resource_match")
                 if (
@@ -1376,7 +1394,7 @@ class XianyuLive:
                     or not all(isinstance(tag, str) and tag.strip() for tag in tags)
                 ):
                     raise RuntimeError("网盘商品必须配置有效 resource_match")
-        return by_item
+        return by_item, by_sku
 
     def _load_pan_resources(self, products=None):
         configured_products = self.products if products is None else products
@@ -1456,9 +1474,22 @@ class XianyuLive:
             )
         return "\n\n".join(blocks)
 
-    def classify_item(self, item_id):
+    def classify_item(self, item_id, sku_id=None):
         """Only explicit platform item IDs may enable automatic delivery."""
-        return self.products.get(str(item_id))
+        config = self.products.get(str(item_id))
+        if config and config.get("delivery") == "sku":
+            return getattr(self, "sku_products", {}).get((str(item_id), str(sku_id)))
+        # A verified SKU order must never fall back to a whole-item template.
+        return None if sku_id is not None else config
+
+    def _has_delivery_item(self, item_id):
+        return str(item_id) in self.products
+
+    def _sku_rejection(self, item_id, sku_id):
+        config = self.products.get(str(item_id))
+        if config and config.get("delivery") == "sku" and sku_id is None:
+            return "sku_unavailable"
+        return "unsupported_sku" if sku_id is not None else "unsupported_item"
 
     @staticmethod
     def _json_object(value):
@@ -1545,6 +1576,14 @@ class XianyuLive:
             if order_info and isinstance(order_info.get("data"), dict):
                 order_info = order_info["data"]
         item_info = cls._json_object(order_info.get("itemInfo")) if order_info else None
+        # Read only explicit platform IDs; display labels and prices never
+        # identify a variant. Conflicting or malformed IDs fail closed.
+        sku_values = [source["skuId"] for source in (data, ut_args, item_info or {})
+                      if source.get("skuId") not in (None, "", 0, "0")]
+        sku_ids = [cls._numeric_identifier(value) for value in sku_values]
+        if any(value is None for value in sku_ids) or len(set(sku_ids)) > 1:
+            raise OrderVerificationRejected("sku_unavailable")
+        sku_id = sku_ids[0] if sku_ids else None
         price_info = cls._json_object(order_info.get("priceInfo")) if order_info else None
         amount = cls._json_object(price_info.get("amount")) if price_info else None
         amount_value = amount.get("value") if amount else None
@@ -1608,6 +1647,7 @@ class XianyuLive:
             "quantity": quantity,
             "paid_amount": normalized_amount,
             "ut_status": str(ut_status).strip()[:64],
+            "sku_id": sku_id,
         }
 
     @staticmethod
@@ -1726,8 +1766,7 @@ class XianyuLive:
         if binding is None:
             self._record_unverified_manual(event, "chat_binding_unavailable")
             return True
-        item_config = self.classify_item(binding["item_id"])
-        if item_config is None:
+        if not self._has_delivery_item(binding["item_id"]):
             self._record_unverified_manual(event, "unsupported_item")
             return True
 
@@ -1758,10 +1797,17 @@ class XianyuLive:
         detail_response = await self._call_xianyu_api(
             self.xianyu.get_order_detail, head["order_id"]
         )
-        detail = self._parse_order_detail(detail_response)
+        try:
+            detail = self._parse_order_detail(detail_response)
+        except OrderVerificationRejected as exc:
+            self._record_unverified_manual(event, exc.reason, head["order_id"])
+            return True
+        item_config = self.classify_item(binding["item_id"], detail.get("sku_id"))
         rejection = self._verification_rejection(
             head, detail, binding, item_config
         )
+        if item_config is None:
+            rejection = rejection or self._sku_rejection(binding["item_id"], detail.get("sku_id"))
         if existing is None or existing.platform_order_id is None:
             payment = self.delivery_store.record_verified_payment_event(
                 order_key,
@@ -1772,6 +1818,7 @@ class XianyuLive:
                 platform_status=str(detail["status"]),
                 paid_amount=detail["paid_amount"],
                 quantity=detail["quantity"],
+                sku_id=detail.get("sku_id"),
             )
         else:
             if (
@@ -1782,6 +1829,8 @@ class XianyuLive:
             ):
                 rejection = rejection or "order_reverification_failed"
             payment = existing
+            if existing.sku_id != detail.get("sku_id"):
+                rejection = "order_sku_mismatch"
         if rejection:
             self.delivery_store.mark_order_manual_review(
                 order_key, rejection
@@ -1812,7 +1861,7 @@ class XianyuLive:
         for order in revived_orders:
             binding = self.delivery_store.get_chat_binding(order.chat_id)
             item_config = (
-                self.classify_item(binding["item_id"]) if binding else None
+                self.classify_item(binding["item_id"], order.sku_id) if binding else None
             )
             if item_config is None:
                 self.delivery_store.mark_order_manual_review(
@@ -1828,7 +1877,7 @@ class XianyuLive:
                     type(exc).__name__,
                 )
         for order in self.delivery_store.retryable_orders():
-            item_config = self.classify_item(order.item_id)
+            item_config = self.classify_item(order.item_id, order.sku_id)
             if (
                 item_config is None
                 or item_config.get("delivery") != order.delivery_type
@@ -1900,8 +1949,7 @@ class XianyuLive:
         reservations, per-order locking and the reverify-before-send path. It
         never sends into a conversation it cannot resolve from verified facts.
         """
-        item_config = self.classify_item(order["item_id"])
-        if item_config is None:
+        if not self._has_delivery_item(order["item_id"]):
             return
         if order["in_refund"]:
             return
@@ -1958,6 +2006,10 @@ class XianyuLive:
                 chat_id, order["buyer_id"], order["item_id"], observed_at=time.time()
             ):
                 logger.warning("待发货订单会话绑定冲突 chat={}", stable_ref(chat_id))
+        item_config = self.classify_item(order["item_id"], detail.get("sku_id"))
+        if existing is not None and existing.sku_id != detail.get("sku_id"):
+            self.delivery_store.mark_order_manual_review(order_key, "order_sku_mismatch")
+            return
         try:
             self.delivery_store.record_verified_payment_event(
                 order_key,
@@ -1968,9 +2020,15 @@ class XianyuLive:
                 platform_status="2",
                 paid_amount=detail["paid_amount"] or order["paid_amount"],
                 quantity=detail["quantity"],
+                sku_id=detail.get("sku_id"),
             )
         except DeliveryStoreError as exc:
             logger.warning("待发货订单付款记录写入跳过 order_id={} error={}", order["order_id"], exc)
+            return
+        if item_config is None:
+            self.delivery_store.mark_order_manual_review(
+                order_key, self._sku_rejection(order["item_id"], detail.get("sku_id"))
+            )
             return
         await self._fulfill_order(
             order_key,
@@ -2089,6 +2147,8 @@ class XianyuLive:
             raise OrderVerificationRejected("order_not_awaiting_shipment")
         if detail["quantity"] != reservation.quantity:
             raise OrderVerificationRejected("unsupported_quantity")
+        if detail.get("sku_id") != reservation.sku_id:
+            raise OrderVerificationRejected("order_sku_mismatch")
         if reservation.delivery_type == "material" and detail["quantity"] != 1:
             raise OrderVerificationRejected("unsupported_quantity")
         if detail["paid_amount"] != reservation.paid_amount:
@@ -2143,7 +2203,7 @@ class XianyuLive:
                             order_key, "chat_binding_unavailable"
                         )
                         return "manual_review"
-            if self.classify_item(current.item_id or binding["item_id"]) != item_config:
+            if self.classify_item(current.item_id or binding["item_id"], current.sku_id) != item_config:
                 self.delivery_store.mark_order_manual_review(order_key, "unsupported_item")
                 return "manual_review"
             delivery_type = item_config.get("delivery")
@@ -2186,6 +2246,7 @@ class XianyuLive:
                 quantity=current.quantity or 1,
                 delivery_payload=delivery_payload,
                 pool_id=item_config.get("card_pool_id", "redeem"),
+                sku_id=current.sku_id,
             )
             if reservation.status in {"delivered", "manual_review", "cancelled", "expired"}:
                 return reservation.status
@@ -2202,7 +2263,7 @@ class XianyuLive:
                 # on every reconnect attempt, before any payload is sent.
                 self._refresh_products()
                 self._refresh_redeem_inventory()
-                latest_config = self.classify_item(reservation.item_id)
+                latest_config = self.classify_item(reservation.item_id, reservation.sku_id)
                 if latest_config is None or latest_config.get("delivery") != reservation.delivery_type:
                     raise OrderVerificationRejected("unsupported_item")
                 if reservation.delivery_type == "redeem" and latest_config.get("card_pool_id", "redeem") != reservation.pool_id:

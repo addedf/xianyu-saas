@@ -190,6 +190,16 @@ def item_ids(raw):
     return clean
 
 
+def template_sku_id(raw):
+    value = raw.get("sku_id")
+    if value is None or value == "":
+        return ""
+    try:
+        return _safe_item_id(value)
+    except AutomationValidationError as exc:
+        raise FulfillmentConfigError(message="SKU ID 格式无效") from exc
+
+
 def products_document(value):
     if value is None:
         return {"version": 1, "types": []}
@@ -198,6 +208,12 @@ def products_document(value):
     validate_receipt(value)
     for entry in value["types"]:
         if not isinstance(entry, dict) or entry.get("delivery") not in {"material", "pan", "redeem"} or type(entry.get("enabled", True)) is not bool:
+            raise FulfillmentConfigError("storage_unavailable", status_code=503)
+        try:
+            sku_id = template_sku_id(entry)
+        except FulfillmentConfigError as exc:
+            raise FulfillmentConfigError("storage_unavailable", status_code=503) from exc
+        if sku_id and (entry["delivery"] not in {"pan", "redeem"} or len(item_ids(entry)) != 1):
             raise FulfillmentConfigError("storage_unavailable", status_code=503)
         item_ids(entry)
         if entry["delivery"] == "redeem":
@@ -250,6 +266,18 @@ def normalise_template_item_ids(raw, snapshot, preserved_item_ids=None):
     return selected
 
 
+def snapshot_contains_sku(snapshot, item_id, sku_id) -> bool:
+    for product in (snapshot or {}).get("products", []):
+        if not isinstance(product, dict) or str(product.get("id")) != item_id:
+            continue
+        skus = product.get("skus")
+        return isinstance(skus, list) and any(
+            isinstance(sku, dict) and str(sku.get("sku_id")) == sku_id
+            for sku in skus
+        )
+    return False
+
+
 def normalise_template_input(raw, snapshot, preserved_item_ids=None):
     if not isinstance(raw, dict):
         raise FulfillmentConfigError()
@@ -266,6 +294,11 @@ def normalise_template_input(raw, snapshot, preserved_item_ids=None):
         raise FulfillmentConfigError()
     result = {"name": name, "delivery": delivery, "enabled": enabled,
               "item_ids": normalise_template_item_ids(raw, snapshot, preserved_item_ids)}
+    sku_id = template_sku_id(raw)
+    if sku_id:
+        if len(result["item_ids"]) != 1 or not snapshot_contains_sku(snapshot, result["item_ids"][0], sku_id):
+            raise FulfillmentConfigError(message="一个 SKU 模板只能绑定当前商品的一个有效规格")
+        result["sku_id"] = sku_id
     for key, limit in (("description", 500), ("price", 120)):
         if raw.get(key) is not None:
             value = raw[key]
@@ -283,7 +316,7 @@ def normalise_template_input(raw, snapshot, preserved_item_ids=None):
 
 
 def template_public(item):
-    result = {key: copy.deepcopy(item[key]) for key in ("id", "name", "description", "price", "delivery", "resource_match", "card_pool_id") if key in item}
+    result = {key: copy.deepcopy(item[key]) for key in ("id", "name", "description", "price", "delivery", "resource_match", "card_pool_id", "sku_id") if key in item}
     if item.get("delivery") == "redeem":
         result["card_pool_id"] = item.get("card_pool_id", "redeem")
     result.update(item_ids=item_ids(item), enabled=item.get("enabled", True))
@@ -291,6 +324,14 @@ def template_public(item):
     if item.get("payload") or item.get("material"):
         result["payload_set"] = True
     return result
+
+
+def _bindings_conflict(first, second) -> bool:
+    if not set(item_ids(first)).intersection(item_ids(second)):
+        return False
+    first_sku = template_sku_id(first)
+    second_sku = template_sku_id(second)
+    return not first_sku or not second_sku or first_sku == second_sku
 
 
 def upsert_template(document, raw, snapshot, *, new_id):
@@ -312,13 +353,14 @@ def upsert_template(document, raw, snapshot, *, new_id):
         if field not in clean:
             saved.pop(field, None)
     saved.pop("item_id", None)
+    if "sku_id" not in clean:
+        saved.pop("sku_id", None)
     if saved["delivery"] != "pan":
         saved.pop("resource_match", None)
     else:
         saved.pop("card_pool_id", None)
-    targets = set(saved["item_ids"])
-    if any(targets.intersection(item_ids(row)) for index, row in enumerate(result["types"]) if index != position):
-        raise FulfillmentConfigError("clarification_required", "商品已绑定其他模板，请明确处理绑定冲突")
+    if any(_bindings_conflict(saved, row) for index, row in enumerate(result["types"]) if index != position):
+        raise FulfillmentConfigError("clarification_required", "商品或 SKU 已绑定其他模板，请明确处理绑定冲突")
     if position is None:
         result["types"].append(saved)
     else:
@@ -346,6 +388,8 @@ def configure_target(document, item_id, title, delivery, *, enabled, stable_id, 
     """Copy-on-write one product binding; preserve non-target mappings and metadata."""
     result = without_receipt(products_document(document))
     old = target_config(result, item_id)
+    if old and template_sku_id(old):
+        raise FulfillmentConfigError("clarification_required", "多规格商品请按 SKU 使用发货模板配置")
     if type(enabled) is not bool or delivery not in {"material", "pan", "redeem"}:
         raise FulfillmentConfigError()
     if old and old["delivery"] != delivery and not replace_existing:
