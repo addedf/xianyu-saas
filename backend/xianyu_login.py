@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie
 from typing import Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from account_storage import DEFAULT_ACCOUNT_ID, normalize_account_key
 from shop_sync import ShopSyncError
@@ -33,8 +33,8 @@ MINI_LOGIN_URL = "https://passport.goofish.com/mini_login.htm"
 GENERATE_URL = "https://passport.goofish.com/newlogin/qrcode/generate.do"
 QUERY_URL = "https://passport.goofish.com/newlogin/qrcode/query.do"
 LOGIN_URL = "https://passport.goofish.com/login_token/login.do"
-VERIFICATION_EXCHANGE_URL = "https://passport.goofish.com/newlogin/login.do"
 VERIFICATION_TTL_SECONDS = 600
+REMOTE_VERIFICATION_PATH = "/iv/remote/pc/mini_login_check.htm"
 MTOP_URL = (
     "https://h5api.m.goofish.com/h5/"
     "mtop.taobao.idlemessage.pc.loginuser.get/1.0/"
@@ -96,6 +96,8 @@ ERROR_MESSAGES = {
     "network_error": "暂时无法连接闲鱼，请稍后再试。",
     "verification_required": "闲鱼要求安全验证，请打开官方验证页，由本人完成后继续连接。",
     "verification_failed": "官方校验尚未建立完整登录会话，请重新扫码后再试。",
+    "verification_expired": "本次闲鱼安全验证已过期，请重新生成二维码。",
+    "verification_context_missing": "未取得本次扫码对应的安全验证会话，请重新生成二维码。",
 }
 
 
@@ -416,6 +418,50 @@ def _verification_redirect(data: dict) -> str:
         return _official_verification_url(value)
     except XianyuLoginError:
         return ""
+
+
+def _response_verification_navigation(response, expected_url: str) -> dict:
+    """Resolve a generic IV entry using the server's original QR Cookies."""
+    actual = urlsplit(str(getattr(response, "url", expected_url) or expected_url))
+    expected = urlsplit(expected_url)
+    if (
+        actual.scheme != "https" or actual.hostname != PASSPORT_HOST
+        or actual.path != expected.path or actual.username is not None
+        or actual.password is not None or actual.port not in (None, 443)
+    ):
+        raise XianyuLoginError("platform_error")
+    if response.status_code in {301, 302, 303, 307, 308}:
+        location = response.headers.get("Location", "")
+        if not isinstance(location, str) or not 1 <= len(location) <= 8192:
+            raise XianyuLoginError("platform_error")
+        return {"redirect": _official_verification_url(urljoin(expected_url, location))}
+    # Consume the bounded response without executing any remote JavaScript.
+    _response_body(response, expected_url)
+    return {"redirect": ""}
+
+
+def _response_verification_callback(response, expected_url: str) -> dict:
+    """The official completion endpoint returns HTML with a JSON result."""
+    try:
+        page = _response_body(response, expected_url).decode("utf-8")
+        marker = re.search(r"\bvar\s+result\s*=\s*", page)
+        if marker is None:
+            raise ValueError("missing official completion result")
+        result, _ = json.JSONDecoder().raw_decode(page[marker.end():])
+        data = result.get("data") if isinstance(result, dict) else None
+        success = isinstance(result, dict) and result.get("success") is True
+        finished = isinstance(data, dict) and data.get("processFinished") is True
+        LOGGER.warning(
+            "qr_verification_callback_result: success=%s process_finished=%s",
+            success, finished,
+        )
+        if not success or not isinstance(data, dict):
+            raise ValueError("official completion was not successful")
+        return data
+    except XianyuLoginError:
+        raise
+    except (TypeError, ValueError, UnicodeError):
+        raise XianyuLoginError("verification_context_missing") from None
 
 
 def _validate_svg(value) -> bytes:
@@ -882,6 +928,40 @@ class XianyuLoginManager:
             )
             raise XianyuLoginError("qr_cookie_incomplete") from None
 
+    def _prepare_verification_url(self, item: _Login, url: str) -> str:
+        url = _official_verification_url(url)
+        # This address contains no ticket. Opening it directly in a different
+        # browser uses that browser's Cookies, losing the server's QR context.
+        if urlsplit(url).path != REMOTE_VERIFICATION_PATH:
+            return url
+        seen = set()
+        for _ in range(4):
+            if url in seen:
+                raise XianyuLoginError("verification_context_missing")
+            seen.add(url)
+            navigation = self._call_json(
+                item, "GET", url, response_parser=_response_verification_navigation,
+                headers={"Accept": "text/html", "Referer": MINI_LOGIN_URL},
+            )
+            destination = navigation["redirect"]
+            target = urlsplit(destination or url)
+            expired = target.path == "/iv/static/mini_expired.htm"
+            LOGGER.warning(
+                "qr_verification_entry: redirected=%s expired=%s bound_query=%s",
+                bool(destination), expired, bool(target.query),
+            )
+            if expired:
+                raise XianyuLoginError("verification_expired")
+            if destination and target.path != REMOTE_VERIFICATION_PATH and target.query:
+                # The ticketed page can now be opened by the account owner.
+                return destination
+            if not destination:
+                if target.path == REMOTE_VERIFICATION_PATH:
+                    raise XianyuLoginError("verification_context_missing")
+                return url
+            url = destination
+        raise XianyuLoginError("verification_context_missing")
+
     def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID, *, _verification_check=False) -> dict:
         item, now = self._get(user_id, login_id, account_key)
         with self._lock:
@@ -993,6 +1073,12 @@ class XianyuLoginManager:
         except _VerificationNeeded as exc:
             verification_url = exc.url
             next_status = "verification_required"
+            try:
+                verification_url = self._prepare_verification_url(item, verification_url)
+            except ShopSyncError as error:
+                temporary_error = error
+            except XianyuLoginError as error:
+                error_code = error.code
         except ShopSyncError as exc:
             temporary_error = exc
         except XianyuLoginError as exc:
@@ -1072,7 +1158,10 @@ class XianyuLoginManager:
         values = query.get("havana_iv_token") or query.get("havanaIvToken") or []
         if len(values) != 1:
             raise XianyuLoginError("invalid_request")
-        token = _opaque_token(values[0])
+        _opaque_token(values[0])
+        for name in ("havana_iv_token", "havanaIvToken", "ck", "sg", "cdt", "scene", "lang", "rf", "appName", "appEntrance"):
+            if len(query.get(name, [])) > 1:
+                raise XianyuLoginError("invalid_request")
         item, now = self._get(user_id, login_id, account_key)
         digest = hashlib.sha256(callback_url.encode("ascii")).hexdigest()
         with self._lock:
@@ -1088,35 +1177,33 @@ class XianyuLoginManager:
             item.in_flight = True
         header = ""
         failed = False
+        failure_code = "verification_failed"
+        temporary_error = None
         next_verification = ""
         try:
-            form = {
-                **item.login_form, "appName": "xianyu", "fromSite": "77",
-                "appEntrance": "web", "bizScene": "qrcode", "scene": "qrcode",
-                "deviceId": "", "havana_iv_token": token, "havanaIvToken": token,
-                "token": item.login_token, "t": item.query_token, "ck": item.query_ck,
-            }
-            for key in ("ck", "sg", "cdt", "scene", "lang", "rf"):
-                candidates = query.get(key, [])
-                if len(candidates) > 1:
-                    raise XianyuLoginError("invalid_request")
-                if candidates:
-                    value = candidates[0]
-                    if len(value) > 4096 or not value.isascii() or any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
-                        raise XianyuLoginError("invalid_request")
-                    form[key] = value
-            payload = self._call_json(
-                item, "POST", VERIFICATION_EXCHANGE_URL,
-                params={"havanaIvToken": token, "appName": "xianyu", "fromSite": "77", "appEntrance": "web", "bizScene": "qrcode"},
-                data=form,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "Origin": "https://passport.goofish.com", "Referer": MINI_LOGIN_URL},
+            # The completion page itself establishes the official session via
+            # Set-Cookie. A separate login.do POST loses this navigation step.
+            LOGGER.warning(
+                "qr_verification_callback_context: ck_matches_qr=%s",
+                query.get("ck", [""])[0] == item.query_ck,
             )
-            data = _content_data(payload)
+            data = self._call_json(
+                item, "GET", callback_url, response_parser=_response_verification_callback,
+                headers={"Accept": "text/html", "Referer": MINI_LOGIN_URL},
+            )
             next_verification = _verification_redirect(data)
             if not next_verification:
-                header = self._confirm(item, item.login_token)
+                header = self._confirm(item, _login_token(data))
         except _VerificationNeeded as exc:
             next_verification = exc.url
+        except ShopSyncError as error:
+            temporary_error = error
+        except XianyuLoginError as error:
+            if error.code in {"login_busy", "network_error"}:
+                temporary_error = error
+            else:
+                failure_code = error.code if error.code.startswith("verification_") else "verification_failed"
+                failed = True
         except Exception:
             failed = True
         with self._lock:
@@ -1125,17 +1212,19 @@ class XianyuLoginManager:
             if self._items.get(item.login_id) is not item or current_now >= item.expires_at:
                 self._expire(item, current_now)
                 raise XianyuLoginError("login_expired")
+            if temporary_error is not None:
+                raise temporary_error
             if next_verification:
                 item.verification_url = next_verification
                 return self._public(item, current_now)
             if failed or not header:
                 item.status = "error"
-                item.error_code = "verification_failed"
+                item.error_code = failure_code
                 result = self._public(item, current_now)
                 self._by_user.pop((item.user_id, item.account_key), None)
                 self._items.pop(item.login_id, None)
                 self._cleanup(item)
-                LOGGER.warning("qr_verification_exchange_failed")
+                LOGGER.warning("qr_verification_exchange_failed: code=%s", failure_code)
                 return result
             self._renew(item, self._confirmed_ttl + self._timeout + 10)
             item.status = "confirmed"

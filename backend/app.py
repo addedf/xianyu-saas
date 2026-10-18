@@ -2635,6 +2635,8 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "qr_cookie_incomplete": 422,
         "verification_required": 409,
         "verification_failed": 422,
+        "verification_expired": 410,
+        "verification_context_missing": 422,
         "network_error": 503,
         "platform_error": 502,
     }
