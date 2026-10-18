@@ -2500,8 +2500,13 @@
           + "/verification?account_key=" + encodeURIComponent(login.accountKey);
       } else verificationLink.removeAttribute("href");
     }
-    const verificationForm = $("#xianyuVerificationForm");
+    const verificationForm = $("#xianyuVerificationFallback");
     if (verificationForm) verificationForm.hidden = !verification;
+    const verificationCheck = $("#checkXianyuVerification");
+    if (verificationCheck) {
+      verificationCheck.hidden = !verification;
+      verificationCheck.disabled = Boolean(login.operation);
+    }
     const verificationSubmit = $("#completeXianyuVerification");
     if (verificationSubmit) verificationSubmit.disabled = Boolean(login.operation);
     const verificationInput = $("#xianyuVerificationCallback");
@@ -2672,9 +2677,10 @@
     event.preventDefault();
     const login = state.qrLogin;
     const input = $("#xianyuVerificationCallback");
-    const callbackUrl = String(input?.value || "").trim();
+    const withCallback = event.currentTarget?.id === "xianyuVerificationForm";
+    const callbackUrl = withCallback ? String(input?.value || "").trim() : "";
     if (login.operation || !login.loginId || login.status !== "verification_required") return;
-    if (!callbackUrl || callbackUrl.length > 8192) {
+    if (withCallback && (!callbackUrl || callbackUrl.length > 8192)) {
       showToast("请填写闲鱼官方验证完成页面的地址", "warning");
       return;
     }
@@ -2701,7 +2707,11 @@
       scheduleQrLoginPoll(login.generation, 6000);
     } catch (error) {
       if (state.qrLogin !== login) return;
-      if (error?.code === "invalid_request" || error?.status === 400) {
+      if (["login_busy", "network_error", "sync_busy", "sync_cooldown"].includes(error?.code)) {
+        login.status = "verification_required";
+        login.message = "暂时无法确认校验结果，当前会话已保留，请稍后继续检查。";
+        scheduleQrLoginPoll(login.generation, 6000);
+      } else if (error?.code === "invalid_request" || error?.status === 400) {
         login.status = "verification_required";
         login.message = "请填写官方校验完成后跳转的页面地址。校验页面本身的链接不能用于继续登录。";
         scheduleQrLoginPoll(login.generation, 6000);
@@ -10187,6 +10197,7 @@
     $("#headerLogoutButton").addEventListener("click", logout);
     $("#xianyuConnectButton").addEventListener("click", startXianyuLogin);
     $("#xianyuVerificationForm")?.addEventListener("submit", finishXianyuVerification);
+    $("#checkXianyuVerification")?.addEventListener("click", finishXianyuVerification);
     $("#refreshXianyuLogin").addEventListener("click", () => {
       const login = state.qrLogin;
       if (login.operation || login.polling || qrRemaining(login.retryAt)) return;
