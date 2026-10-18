@@ -20,13 +20,14 @@ import time
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from account_storage import DEFAULT_ACCOUNT_ID, normalize_account_key
 from shop_sync import ShopSyncError
 
 
 PASSPORT_HOST = "passport.goofish.com"
+MINI_LOGIN_URL = "https://passport.goofish.com/mini_login.htm"
 GENERATE_URL = "https://passport.goofish.com/newlogin/qrcode/generate.do"
 QUERY_URL = "https://passport.goofish.com/newlogin/qrcode/query.do"
 LOGIN_URL = "https://passport.goofish.com/login_token/login.do"
@@ -126,6 +127,7 @@ class _Login:
     session_closed: bool = False
     connection_lease: object = field(default=None, repr=False)
     lease_released: bool = False
+    login_form: dict = field(default_factory=dict, repr=False)
 
 
 def _new_requests_session():
@@ -178,7 +180,7 @@ def _safe_login_id(value) -> str:
     return value
 
 
-def _response_json(response, expected_url: str) -> dict:
+def _response_body(response, expected_url: str) -> bytes:
     try:
         status_code = int(response.status_code)
         headers = response.headers
@@ -215,7 +217,16 @@ def _response_json(response, expected_url: str) -> dict:
             if len(raw_content) + len(chunk) > MAX_RESPONSE_BYTES:
                 raise XianyuLoginError("platform_error")
             raw_content.extend(chunk)
-        payload = json.loads(bytes(raw_content).decode("utf-8"))
+        return bytes(raw_content)
+    except XianyuLoginError:
+        raise
+    except Exception:
+        raise XianyuLoginError("platform_error") from None
+
+
+def _response_json(response, expected_url: str) -> dict:
+    try:
+        payload = json.loads(_response_body(response, expected_url).decode("utf-8"))
     except XianyuLoginError:
         raise
     except Exception:
@@ -223,6 +234,47 @@ def _response_json(response, expected_url: str) -> dict:
     if not isinstance(payload, dict):
         raise XianyuLoginError("platform_error")
     return payload
+
+
+def _response_login_form(response, expected_url: str) -> dict:
+    try:
+        page = _response_body(response, expected_url).decode("utf-8")
+        marker = re.search(r"window\.viewData\s*=\s*", page)
+        if marker is None:
+            raise ValueError("missing login form")
+        view, _ = json.JSONDecoder().raw_decode(page[marker.end():])
+        form = view.get("loginFormData") if isinstance(view, dict) else None
+        if not isinstance(form, dict):
+            raise ValueError("invalid login form")
+        allowed = {
+            "_csrf_token", "appEntrance", "appName", "bizParams", "fromSite",
+            "hsiz", "isMobile", "lang", "mainPage", "returnUrl", "umidToken",
+        }
+        result = {}
+        for key in allowed:
+            value = form.get(key)
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                value = "true" if value else "false"
+            elif isinstance(value, int):
+                value = str(value)
+            if (
+                not isinstance(value, str) or len(value) > 8192
+                or not value.isascii()
+                or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+            ):
+                raise ValueError("invalid login form value")
+            result[key] = value
+        if result.get("appName") != "xianyu" or result.get("fromSite") != "77":
+            raise ValueError("unexpected login application")
+        if not result.get("_csrf_token") or sum(map(len, result.values())) > 16384:
+            raise ValueError("incomplete login form")
+        return result
+    except XianyuLoginError:
+        raise
+    except Exception:
+        raise XianyuLoginError("platform_error") from None
 
 
 def _content_data(payload: dict) -> dict:
@@ -272,6 +324,21 @@ def _login_token(data: dict) -> str:
         direct = data.get(key)
         if direct is not None:
             return _opaque_token(direct)
+    # Current passport flows can place the one-time token in the login iframe
+    # URL instead of returning a separate token field. Never follow that URL.
+    redirect = data.get("iframeRedirectUrl")
+    if data.get("iframeRedirect") is True and isinstance(redirect, str):
+        parsed = urlsplit(redirect)
+        if (
+            len(redirect) > 8192 or parsed.scheme != "https"
+            or parsed.hostname != PASSPORT_HOST or parsed.path != "/login_token/login.do"
+            or parsed.username is not None or parsed.password is not None
+            or parsed.port not in (None, 443) or parsed.fragment
+        ):
+            raise XianyuLoginError("platform_error")
+        tokens = parse_qs(parsed.query, max_num_fields=32).get("token", [])
+        if len(tokens) == 1:
+            return _opaque_token(tokens[0])
     extension = data.get("bizExt")
     if extension is None:
         return ""
@@ -427,6 +494,7 @@ class XianyuLoginManager:
         item.query_token = ""
         item.query_ck = ""
         item.login_token = ""
+        item.login_form.clear()
         item.cookie_header = ""
         XianyuLoginManager._close_session(item)
         if item.connection_lease is not None and not item.lease_released:
@@ -511,7 +579,10 @@ class XianyuLoginManager:
             except Exception:
                 raise XianyuLoginError("login_expired") from None
 
-    def _call_json(self, item: _Login, method: str, url: str, **kwargs) -> dict:
+    def _call_json(
+        self, item: _Login, method: str, url: str,
+        *, response_parser: Callable = _response_json, **kwargs,
+    ) -> dict:
         with self._lock:
             now = float(self._clock())
             if self._items.get(item.login_id) is not item or now >= item.expires_at:
@@ -534,7 +605,7 @@ class XianyuLoginManager:
                     raise XianyuLoginError("login_expired")
                 self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
             response = item.session.request(method, url, **kwargs)
-            return _response_json(response, url)
+            return response_parser(response, url)
         except (XianyuLoginError, ShopSyncError):
             raise
         except Exception:
@@ -583,9 +654,22 @@ class XianyuLoginManager:
             self._last_start[scope] = now
 
         try:
+            self._initialize_mtop(item, MTOP_BOOTSTRAP_URL, MTOP_BOOTSTRAP_API)
+            item.login_form = self._call_json(
+                item, "GET", MINI_LOGIN_URL,
+                response_parser=_response_login_form,
+                params={
+                    "lang": "zh_cn", "appName": "xianyu", "appEntrance": "web",
+                    "styleType": "vertical", "notLoadSsoView": "false",
+                    "notKeepLogin": "false", "isMobile": "false",
+                    "qrCodeFirst": "false", "stie": "77",
+                },
+                headers={"Accept": "text/html", "Referer": "https://www.goofish.com/"},
+            )
             payload = self._call_json(
                 item, "GET", GENERATE_URL,
-                params={"appName": "xianyu", "appEntrance": "web", "fromSite": "77"},
+                params={**item.login_form, "appName": "xianyu", "appEntrance": "web", "fromSite": "77"},
+                headers={"Referer": MINI_LOGIN_URL},
             )
             data = _content_data(payload)
             qr_url = _qr_url(data.get("codeContent"))
@@ -739,8 +823,9 @@ class XianyuLoginManager:
                 payload = self._call_json(
                     item, "POST", QUERY_URL,
                     params={"appName": "xianyu", "fromSite": "77"},
-                    data={"appName": "xianyu", "fromSite": "77", "appEntrance": "web",
-                          "t": query_token, "ck": query_ck},
+                    data={**item.login_form, "appName": "xianyu", "fromSite": "77", "appEntrance": "web",
+                          "isIframe": "true", "documentReferer": "https://www.goofish.com/",
+                          "defaultView": "qrcode", "t": query_token, "ck": query_ck},
                     headers={
                         "Content-Type": "application/x-www-form-urlencoded",
                         "Origin": "https://passport.goofish.com",
@@ -767,6 +852,11 @@ class XianyuLoginManager:
                     login_token = _login_token(data)
                 except XianyuLoginError:
                     raise XianyuLoginError("login_confirm_failed") from None
+                LOGGER.warning(
+                    "qr_confirmed_context: token_present=%s iframe_redirect=%s async_urls_present=%s",
+                    bool(login_token), data.get("iframeRedirect") is True,
+                    bool(data.get("asyncUrls")),
+                )
                 cookie_header = self._confirm(item, login_token)
                 next_status = "confirmed"
             else:
@@ -816,6 +906,7 @@ class XianyuLoginManager:
                 item.expires_at = current_now + self._confirmed_ttl
                 item.query_token = ""
                 item.query_ck = ""
+                item.login_form.clear()
                 item.qr_url = ""
                 item.qr_svg = b""
                 self._close_session(item)
