@@ -10,9 +10,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import queue
 import threading
+import tempfile
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 
 
@@ -169,15 +172,27 @@ class OfficialLoginBrowser:
 
     def _run(self):
         playwright = browser = context = None
+        runtime_directory = None
         opening = False
         stage = "launch"
         try:
             from playwright.sync_api import sync_playwright, Error as PlaywrightError, TimeoutError as PlaywrightTimeout
 
+            runtime_directory = tempfile.TemporaryDirectory(prefix="xianyu-login-")
+            runtime = Path(runtime_directory.name)
+            for folder in (runtime / "config", runtime / "cache"):
+                folder.mkdir(mode=0o700)
+            browser_environment = {
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "LANG": "zh_CN.UTF-8", "TZ": "Asia/Shanghai",
+                "XDG_CONFIG_HOME": str(runtime / "config"),
+                "XDG_CACHE_HOME": str(runtime / "cache"),
+            }
             playwright = sync_playwright().start()
             browser = playwright.chromium.launch(
                 channel="chromium", headless=True,
                 args=["--renderer-process-limit=2"],
+                env=browser_environment,
             )
             context = browser.new_context(
                 viewport={"width": _WIDTH, "height": _HEIGHT}, device_scale_factor=1,
@@ -268,6 +283,11 @@ class OfficialLoginBrowser:
                 try:
                     playwright.stop()
                 except Exception:
+                    pass
+            if runtime_directory is not None:
+                try:
+                    runtime_directory.cleanup()
+                except OSError:
                     pass
             with self._lock:
                 self._cookies.clear()
