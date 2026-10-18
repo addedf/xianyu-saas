@@ -390,7 +390,7 @@ def _official_verification_url(value, *, callback: bool = False) -> str:
         parsed = urlsplit(value)
         allowed_path = (
             parsed.path == "/newlogin/safe/ivCheckLogin.htm" if callback
-            else parsed.path in {"/iv/entry", "/iv/verify.htm", "/iv/verify.html"}
+            else bool(re.fullmatch(r"/iv/[A-Za-z0-9_./-]{1,180}", parsed.path))
         )
         if (
             parsed.scheme != "https" or parsed.hostname != PASSPORT_HOST
@@ -485,6 +485,16 @@ def _has_signing_cookie(session, now: float) -> bool:
     return any(
         str(getattr(cookie, "name", "")) == "_m_h5_tk"
         and "_" in str(getattr(cookie, "value", ""))
+        and _cookie_applies(cookie, target.hostname or "", target.path, now)
+        for cookie in session.cookies
+    )
+
+
+def _has_account_cookie(session, now: float) -> bool:
+    target = urlsplit(MTOP_URL)
+    return any(
+        str(getattr(cookie, "name", "")) == "unb"
+        and str(getattr(cookie, "value", "")).isdigit()
         and _cookie_applies(cookie, target.hostname or "", target.path, now)
         for cookie in session.cookies
     )
@@ -872,17 +882,19 @@ class XianyuLoginManager:
             )
             raise XianyuLoginError("qr_cookie_incomplete") from None
 
-    def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
+    def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID, *, _verification_check=False) -> dict:
         item, now = self._get(user_id, login_id, account_key)
         with self._lock:
+            was_verification = item.status == "verification_required"
             if item.status in {"confirmed", "expired", "error"}:
                 return self._public(item, now)
-            if item.status == "verification_required":
+            if was_verification and not _verification_check:
                 self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
                 return self._public(item, now)
             if item.in_flight:
                 raise XianyuLoginError("login_busy")
-            if item.last_poll_at and now - item.last_poll_at < self._poll_interval:
+            interval = 5.0 if was_verification else self._poll_interval
+            if item.last_poll_at and now - item.last_poll_at < interval:
                 return self._public(item, now)
             item.in_flight = True
             item.last_poll_at = now
@@ -894,7 +906,7 @@ class XianyuLoginManager:
         cookie_header = ""
         error_code = ""
         temporary_error = None
-        verification_url = ""
+        verification_url = item.verification_url
         try:
             try:
                 payload = self._call_json(
@@ -919,14 +931,15 @@ class XianyuLoginManager:
                 raise XianyuLoginError("qr_query_failed")
             upstream_status = upstream_status.upper()
             if upstream_status == "NEW":
-                next_status = "waiting"
+                next_status = "verification_required" if was_verification else "waiting"
             elif upstream_status in {"SCANED", "SCANNED"}:
-                next_status = "scanned"
+                next_status = "verification_required" if was_verification else "scanned"
             elif upstream_status in {"EXPIRED", "CANCELED"}:
-                next_status = "expired"
+                next_status = "verification_required" if was_verification else "expired"
             elif upstream_status == "CONFIRMED":
-                verification_url = _verification_redirect(data)
-                if verification_url:
+                returned_verification = _verification_redirect(data)
+                if returned_verification:
+                    verification_url = returned_verification
                     try:
                         login_token = _login_token(data)
                     except XianyuLoginError:
@@ -970,8 +983,11 @@ class XianyuLoginManager:
                     bool(login_token), data.get("iframeRedirect") is True,
                     bool(data.get("asyncUrls")),
                 )
-                cookie_header = self._confirm(item, login_token)
-                next_status = "confirmed"
+                if was_verification and not login_token and not _has_account_cookie(item.session, time.time()):
+                    next_status = "verification_required"
+                else:
+                    cookie_header = self._confirm(item, login_token)
+                    next_status = "confirmed"
             else:
                 raise XianyuLoginError("qr_query_failed")
         except _VerificationNeeded as exc:
@@ -995,7 +1011,7 @@ class XianyuLoginManager:
                 self._expire(item, current_now)
                 return self._public(item, current_now)
             item.in_flight = False
-            item.login_token = login_token if next_status == "verification_required" else ""
+            item.login_token = (login_token or item.login_token) if next_status == "verification_required" else ""
             if temporary_error is not None:
                 raise temporary_error
             if error_code in {"login_busy", "network_error"}:
@@ -1042,6 +1058,13 @@ class XianyuLoginManager:
                 raise XianyuLoginError("login_not_confirmed")
             self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
             return _official_verification_url(item.verification_url)
+
+    def check_verification(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
+        item, now = self._get(user_id, login_id, account_key)
+        with self._lock:
+            if item.status not in {"verification_required", "confirmed"}:
+                raise XianyuLoginError("login_expired")
+        return self.poll(user_id, login_id, account_key, _verification_check=True)
 
     def finish_verification(self, user_id, login_id, callback_url, account_key=DEFAULT_ACCOUNT_ID) -> dict:
         callback_url = _official_verification_url(callback_url, callback=True)

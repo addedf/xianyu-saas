@@ -1501,7 +1501,7 @@ class XianyuLoginCompleteIn(BaseModel):
 
 
 class XianyuVerificationCompleteIn(BaseModel):
-    callback_url: str = Field(min_length=1, max_length=8192)
+    callback_url: str = Field(default="", max_length=8192)
 
     class Config:
         extra = "forbid"
@@ -4974,9 +4974,12 @@ def complete_xianyu_verification(
 ):
     _require_permission(user, "shop.configure")
     try:
-        result = qr_logins.finish_verification(
-            user["id"], login_id, body.callback_url, str(account["account_key"]),
-        )
+        if body.callback_url:
+            result = qr_logins.finish_verification(
+                user["id"], login_id, body.callback_url, str(account["account_key"]),
+            )
+        else:
+            result = qr_logins.check_verification(user["id"], login_id, str(account["account_key"]))
         if result.get("status") == "error":
             raise XianyuLoginError(str(result.get("code") or "verification_failed"))
         return result
