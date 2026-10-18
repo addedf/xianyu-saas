@@ -180,6 +180,9 @@
       message: "",
       pollTimer: 0,
       objectUrl: "",
+      browserMode: false,
+      imageRevision: -1,
+      pointer: null,
       generation: 0,
       failures: 0,
       pollAttempts: 0,
@@ -2379,11 +2382,11 @@
     const loginId = state.qrLogin.loginId;
     const accountKey = state.qrLogin.accountKey;
     if (!loginId || !accountKey || state.qrLogin.generation !== generation) return;
-    clearQrLoginImage();
+    if (!state.qrLogin.browserMode) clearQrLoginImage();
     let response;
     try {
       response = await fetch(API_PREFIX + "/api/bot/login/" + encodeURIComponent(loginId) + "/qr.svg", qrLoginRequestOptions(accountKey, {
-        credentials: "same-origin",
+        credentials: "same-origin", cache: "no-store",
       }));
     } catch (error) {
       throw new ApiError("二维码加载失败，请稍后重试");
@@ -2400,9 +2403,61 @@
       URL.revokeObjectURL(objectUrl);
       return;
     }
+    const previousUrl = state.qrLogin.objectUrl;
     state.qrLogin.objectUrl = objectUrl;
+    state.qrLogin.imageRevision = Number(response.headers.get("X-Login-Image-Revision") || 0);
     const image = $("#xianyuQrImage");
     if (image) image.src = objectUrl;
+    if (previousUrl) URL.revokeObjectURL(previousUrl);
+  }
+
+  function qrBrowserPoint(event) {
+    const image = $("#xianyuQrImage");
+    const box = image?.getBoundingClientRect();
+    if (!box?.width || !box?.height) return null;
+    return [Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)),
+      Math.max(0, Math.min(1, (event.clientY - box.top) / box.height))];
+  }
+
+  function beginQrBrowserInput(event) {
+    const login = state.qrLogin;
+    if (!login.browserMode || login.operation || login.pointer || event.button !== 0
+      || !["waiting", "scanned", "verification_required", "paused"].includes(login.status)) return;
+    const point = qrBrowserPoint(event);
+    if (!point) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    login.pointer = { id: event.pointerId, revision: login.imageRevision, points: [point], lastAt: Date.now() };
+  }
+
+  function moveQrBrowserInput(event) {
+    const pointer = state.qrLogin.pointer;
+    if (!pointer || pointer.id !== event.pointerId || pointer.points.length >= 79 || Date.now() - pointer.lastAt < 25) return;
+    const point = qrBrowserPoint(event);
+    if (point) { pointer.points.push(point); pointer.lastAt = Date.now(); }
+  }
+
+  async function endQrBrowserInput(event) {
+    const login = state.qrLogin;
+    const pointer = login.pointer;
+    if (!pointer || pointer.id !== event.pointerId) return;
+    login.pointer = null;
+    if (event.type === "pointercancel") return;
+    const finalPoint = qrBrowserPoint(event);
+    const firstPoint = pointer.points[0];
+    const distance = finalPoint ? Math.hypot(finalPoint[0] - firstPoint[0], finalPoint[1] - firstPoint[1]) : 0;
+    const points = distance < 0.012 && pointer.points.length < 4 ? [firstPoint] : pointer.points.concat(finalPoint ? [finalPoint] : []);
+    try {
+      await api("/api/bot/login/" + encodeURIComponent(login.loginId) + "/browser/action", qrLoginRequestOptions(login.accountKey, {
+        method: "POST", body: JSON.stringify({ revision: pointer.revision, points }),
+      }));
+      if (state.qrLogin === login) scheduleQrLoginPoll(login.generation, 450);
+    } catch (error) {
+      if (state.qrLogin === login) {
+        showToast(error?.code === "login_busy" ? "页面已更新，请稍后再操作" : "操作未送达，请重试", "warning");
+        scheduleQrLoginPoll(login.generation, 500);
+      }
+    }
   }
 
   function qrRemaining(deadline) {
@@ -2461,8 +2516,10 @@
       login.loginId = saved.loginId;
       login.accountKey = saved.accountKey;
       login.status = "verification_required";
+      login.browserMode = result.browser_mode === true;
       recordQrExpiry(result.expires_in);
       openQrLoginDialog();
+      if (login.browserMode) await loadQrLoginImage(login.generation);
       renderQrLogin();
       if (result.status === "confirmed") await completeQrLogin(login.generation);
       else scheduleQrLoginPoll(login.generation, 6000);
@@ -2542,21 +2599,28 @@
       text(refresh.querySelector("span"), wait ? `等待 ${wait} 秒` : login.retryAction === "complete" ? "重试连接" : login.retryAction === "poll" ? "继续检查" : "生成二维码");
     }
     const image = $("#xianyuQrImage");
-    const showQr = ["waiting", "scanned", "paused"].includes(login.status) && Boolean(login.objectUrl);
+    const browserVisible = login.browserMode && ["waiting", "scanned", "paused", "verification_required", "verifying"].includes(login.status);
+    const showQr = (["waiting", "scanned", "paused"].includes(login.status) || browserVisible) && Boolean(login.objectUrl);
     if (image) image.hidden = !showQr;
     const verification = ["verification_required", "verifying"].includes(login.status);
     const frame = $("#qrLoginFrame");
-    if (frame) frame.hidden = verification;
+    if (frame) {
+      frame.hidden = verification && !login.browserMode;
+      frame.classList.toggle("is-browser", browserVisible);
+    }
+    $("#xianyuLoginDialog")?.classList.toggle("has-login-browser", browserVisible);
+    const browserHint = $("#xianyuBrowserHint");
+    if (browserHint) browserHint.hidden = !browserVisible;
     const verificationLink = $("#xianyuVerificationLink");
     if (verificationLink) {
-      verificationLink.hidden = !verification;
-      if (verification && login.loginId && login.accountKey) {
+      verificationLink.hidden = !verification || login.browserMode;
+      if (verification && !login.browserMode && login.loginId && login.accountKey) {
         verificationLink.href = API_PREFIX + "/api/bot/login/" + encodeURIComponent(login.loginId)
           + "/verification?account_key=" + encodeURIComponent(login.accountKey);
       } else verificationLink.removeAttribute("href");
     }
     const verificationForm = $("#xianyuVerificationFallback");
-    if (verificationForm) verificationForm.hidden = !verification;
+    if (verificationForm) verificationForm.hidden = !verification || login.browserMode;
     const verificationCheck = $("#checkXianyuVerification");
     if (verificationCheck) {
       verificationCheck.hidden = !verification;
@@ -2598,6 +2662,9 @@
       message: "",
       pollTimer: 0,
       objectUrl: "",
+      browserMode: false,
+      imageRevision: -1,
+      pointer: null,
       generation: state.qrLogin.generation + 1,
       failures: 0,
       pollAttempts: 0,
@@ -2786,6 +2853,7 @@
     const loginId = login.loginId;
     const accountKey = login.accountKey;
     if (!loginId || !accountKey || login.generation !== generation || login.polling || login.operation || qrRemaining(login.retryAt)) return;
+    if (login.pointer) { scheduleQrLoginPoll(generation, 500); return; }
     if (login.expiresAt && !qrRemaining(login.expiresAt)) { renderQrLogin(); return; }
     login.polling = true;
     try {
@@ -2796,6 +2864,7 @@
       if (state.qrLogin.generation !== generation) return;
       if (!loginResponseIsSafe(result)) throw new ApiError("登录响应包含了不安全数据，已中止连接");
       const status = String(result?.status || "").toLowerCase();
+      login.browserMode = result.browser_mode === true;
       recordQrExpiry(result?.expires_in);
       state.qrLogin.retryAt = 0;
       state.qrLogin.failures = 0;
@@ -2810,7 +2879,7 @@
       if (status === "verification_required") {
         state.qrLogin.status = "verification_required";
         state.qrLogin.pollAttempts = 0;
-        clearQrLoginImage();
+        if (!login.browserMode) clearQrLoginImage();
       } else if (status === "syncing") {
         state.qrLogin.status = "syncing";
       } else if (status === "scanned") {
@@ -2823,9 +2892,10 @@
         state.qrLogin.pollAttempts += 1;
       }
       state.qrLogin.message = typeof result?.message === "string" ? result.message : "";
+      if (login.browserMode && !login.pointer && Number(result.image_revision) !== login.imageRevision) await loadQrLoginImage(generation);
       renderQrLogin();
       if (state.qrLogin.status !== "expired") {
-        const delay = state.qrLogin.status === "verification_required" ? 6000 : state.qrLogin.status === "scanned"
+        const delay = login.browserMode ? 2000 : state.qrLogin.status === "verification_required" ? 6000 : state.qrLogin.status === "scanned"
           ? QR_LOGIN_POLL_MS
           : Math.min(6000, Math.round(QR_LOGIN_POLL_MS * (1.45 ** Math.min(state.qrLogin.pollAttempts, 4))));
         scheduleQrLoginPoll(generation, delay);
@@ -2907,6 +2977,7 @@
       }
       if (!validLoginId) throw new ApiError("登录会话无效，请重试");
       login.loginId = loginId;
+      login.browserMode = result.browser_mode === true;
       login.status = String(result?.status || "waiting").toLowerCase() === "scanned" ? "scanned" : "waiting";
       recordQrExpiry(result?.expires_in);
       await loadQrLoginImage(generation);
@@ -10256,6 +10327,12 @@
     $("#xianyuConnectButton").addEventListener("click", startXianyuLogin);
     $("#xianyuVerificationForm")?.addEventListener("submit", finishXianyuVerification);
     $("#checkXianyuVerification")?.addEventListener("click", finishXianyuVerification);
+    const qrBrowserImage = $("#xianyuQrImage");
+    qrBrowserImage?.addEventListener("pointerdown", beginQrBrowserInput);
+    qrBrowserImage?.addEventListener("pointermove", moveQrBrowserInput);
+    qrBrowserImage?.addEventListener("pointerup", endQrBrowserInput);
+    qrBrowserImage?.addEventListener("pointercancel", endQrBrowserInput);
+    qrBrowserImage?.addEventListener("dragstart", (event) => event.preventDefault());
     $("#refreshXianyuLogin").addEventListener("click", () => {
       const login = state.qrLogin;
       if (login.operation || login.polling || qrRemaining(login.retryAt)) return;
