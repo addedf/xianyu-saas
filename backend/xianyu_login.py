@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -33,7 +34,10 @@ MTOP_URL = (
     "https://h5api.m.goofish.com/h5/"
     "mtop.taobao.idlemessage.pc.loginuser.get/1.0/"
 )
+MTOP_BOOTSTRAP_API = "mtop.taobao.idlehome.home.webpc.feed"
+MTOP_BOOTSTRAP_URL = f"https://h5api.m.goofish.com/h5/{MTOP_BOOTSTRAP_API}/1.0/"
 APP_KEY = "34839810"
+LOGGER = logging.getLogger(__name__)
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_COOKIE_HEADER_BYTES = 32 * 1024
 LOGIN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32,96}$")
@@ -343,6 +347,16 @@ def _cookie_header(session, now: float) -> str:
     return header
 
 
+def _has_signing_cookie(session, now: float) -> bool:
+    target = urlsplit(MTOP_URL)
+    return any(
+        str(getattr(cookie, "name", "")) == "_m_h5_tk"
+        and "_" in str(getattr(cookie, "value", ""))
+        and _cookie_applies(cookie, target.hostname or "", target.path, now)
+        for cookie in session.cookies
+    )
+
+
 class XianyuLoginManager:
     """Thread-safe, per-user registry for official Xianyu QR login flows."""
 
@@ -618,6 +632,31 @@ class XianyuLoginManager:
                 raise XianyuLoginError("platform_error")
             return bytes(item.qr_svg)
 
+    def _initialize_mtop(self, item: _Login, url: str, api: str) -> None:
+        self._call_json(
+            item,
+            "POST",
+            url,
+            params={
+                "jsv": "2.7.2",
+                "appKey": APP_KEY,
+                "t": str(int(time.time() * 1000)),
+                "sign": "",
+                "api": api,
+                "v": "1.0",
+                "type": "originaljson",
+                "dataType": "json",
+                "timeout": "20000",
+                "sessionOption": "AutoLoginOnly",
+            },
+            data={"data": "{}"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://www.goofish.com",
+                "Referer": "https://www.goofish.com/",
+            },
+        )
+
     def _confirm(self, item: _Login, login_token: str) -> str:
         if login_token:
             try:
@@ -647,29 +686,17 @@ class XianyuLoginManager:
                     raise
                 raise XianyuLoginError("login_confirm_failed") from None
         try:
-            self._call_json(
+            self._initialize_mtop(
                 item,
-                "POST",
                 MTOP_URL,
-                params={
-                    "jsv": "2.7.2",
-                    "appKey": APP_KEY,
-                    "t": str(int(time.time() * 1000)),
-                    "sign": "",
-                    "api": "mtop.taobao.idlemessage.pc.loginuser.get",
-                    "v": "1.0",
-                    "type": "originaljson",
-                    "dataType": "json",
-                    "timeout": "20000",
-                    "sessionOption": "AutoLoginOnly",
-                },
-                data={"data": "{}"},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Origin": "https://www.goofish.com",
-                    "Referer": "https://www.goofish.com/",
-                },
+                "mtop.taobao.idlemessage.pc.loginuser.get",
             )
+            # The login-user endpoint may return SESSION_EXPIRED without
+            # issuing a signing Cookie on a fresh QR session. The public home
+            # endpoint initializes that short-lived Cookie; account identity
+            # and authenticated shop access are still validated on completion.
+            if not _has_signing_cookie(item.session, time.time()):
+                self._initialize_mtop(item, MTOP_BOOTSTRAP_URL, MTOP_BOOTSTRAP_API)
         except XianyuLoginError as error:
             if error.code in {"login_busy", "network_error"}:
                 raise
@@ -677,6 +704,15 @@ class XianyuLoginManager:
         try:
             return _cookie_header(item.session, time.time())
         except XianyuLoginError:
+            target = urlsplit(MTOP_URL)
+            names = {
+                str(getattr(cookie, "name", "")) for cookie in item.session.cookies
+                if _cookie_applies(cookie, target.hostname or "", target.path, time.time())
+            }
+            LOGGER.warning(
+                "qr_cookie_incomplete: unb_present=%s signing_cookie_present=%s",
+                "unb" in names, "_m_h5_tk" in names,
+            )
             raise XianyuLoginError("qr_cookie_incomplete") from None
 
     def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> dict:
