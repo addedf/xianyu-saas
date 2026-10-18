@@ -283,6 +283,8 @@ def _request_body_limit(path: str) -> int:
         return AUTH_REQUEST_BODY_LIMIT
     if path == "/api/admin/confirm" or path.startswith("/api/admin/updates/"):
         return SENSITIVE_REQUEST_BODY_LIMIT
+    if path.startswith("/api/bot/login/") and path.endswith("/browser/action"):
+        return 8 * 1024
     if path in {"/api/bot/login/start", "/api/bot/login/complete"} or path.startswith("/api/bot/login/"):
         return SHOP_LOGIN_REQUEST_BODY_LIMIT
     return DEFAULT_REQUEST_BODY_LIMIT
@@ -1507,6 +1509,14 @@ class XianyuVerificationCompleteIn(BaseModel):
         extra = "forbid"
 
 
+class XianyuLoginBrowserActionIn(BaseModel):
+    revision: int = Field(ge=0)
+    points: list[tuple[float, float]] = Field(min_length=1, max_length=80)
+
+    class Config:
+        extra = "forbid"
+
+
 class CodesIn(BaseModel):
     codes: list
 
@@ -2637,6 +2647,7 @@ def _xianyu_login_http_error(error: XianyuLoginError) -> HTTPException:
         "verification_failed": 422,
         "verification_expired": 410,
         "verification_context_missing": 422,
+        "verification_browser_unavailable": 503,
         "network_error": 503,
         "platform_error": 502,
     }
@@ -4907,10 +4918,10 @@ def xianyu_login_qr(
     _require_permission(user, "shop.configure")
     account_key = str(account["account_key"])
     try:
-        svg = (
-            qr_logins.qr_svg(user["id"], login_id)
+        svg, revision = (
+            qr_logins.qr_image(user["id"], login_id)
             if account_key == "default"
-            else qr_logins.qr_svg(user["id"], login_id, account_key)
+            else qr_logins.qr_image(user["id"], login_id, account_key)
         )
     except XianyuLoginError as error:
         raise _xianyu_login_http_error(error) from None
@@ -4920,9 +4931,26 @@ def xianyu_login_qr(
         headers={
             "Cache-Control": "no-store",
             "Content-Disposition": 'inline; filename="xianyu-login.svg"',
-            "Content-Security-Policy": "default-src 'none'",
+            "Content-Security-Policy": "default-src 'none'; img-src data:",
+            "X-Login-Image-Revision": str(revision),
         },
     )
+
+
+@app.post("/api/bot/login/{login_id}/browser/action")
+def xianyu_login_browser_action(
+    login_id: str,
+    body: XianyuLoginBrowserActionIn,
+    user=Depends(Auth.current_user),
+    account=Depends(current_shop_account),
+):
+    _require_permission(user, "shop.configure")
+    try:
+        return qr_logins.browser_action(
+            user["id"], login_id, body.revision, body.points, str(account["account_key"]),
+        )
+    except XianyuLoginError as error:
+        raise _xianyu_login_http_error(error) from None
 
 
 @app.get("/api/bot/login/{login_id}/status")

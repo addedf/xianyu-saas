@@ -98,6 +98,7 @@ ERROR_MESSAGES = {
     "verification_failed": "官方校验尚未建立完整登录会话，请重新扫码后再试。",
     "verification_expired": "本次闲鱼安全验证已过期，请重新生成二维码。",
     "verification_context_missing": "未取得本次扫码对应的安全验证会话，请重新生成二维码。",
+    "verification_browser_unavailable": "官方登录窗口暂时无法打开，请稍后重新连接。",
 }
 
 
@@ -145,6 +146,7 @@ class _Login:
     verification_url: str = field(default="", repr=False)
     verification_started: bool = False
     verification_callback_digest: str = field(default="", repr=False)
+    browser: object = field(default=None, repr=False)
 
 
 def _new_requests_session():
@@ -611,6 +613,9 @@ class XianyuLoginManager:
         item.session_closed = True
 
     def _cleanup(self, item: _Login) -> None:
+        if item.browser is not None:
+            item.browser.close()
+            item.browser = None
         item.qr_url = ""
         item.qr_svg = b""
         item.query_token = ""
@@ -696,6 +701,11 @@ class XianyuLoginManager:
             payload.update({"code": code, "message": ERROR_MESSAGES[code]})
         elif item.status == "verification_required":
             payload.update({"verification_available": True, "message": ERROR_MESSAGES["verification_required"]})
+        if item.browser is not None:
+            snapshot = item.browser.snapshot()
+            payload.update({"browser_mode": True, "image_revision": snapshot["revision"]})
+            if item.status == "verification_required":
+                payload["message"] = "请按上方闲鱼官方页面提示，由本人完成安全验证。完成后会自动继续连接。"
         return payload
 
     def _renew(self, item: _Login, seconds: float) -> None:
@@ -780,6 +790,28 @@ class XianyuLoginManager:
             self._last_start[scope] = now
 
         try:
+            if os.environ.get("SAAS_XIANYU_BROWSER_LOGIN", "0") == "1":
+                from xianyu_login_browser import OfficialLoginBrowser, LoginBrowserBusy
+
+                with self._lock:
+                    item.expires_at = float(self._clock()) + VERIFICATION_TTL_SECONDS
+                    self._renew(item, VERIFICATION_TTL_SECONDS + self._timeout + 10)
+                try:
+                    item.browser = OfficialLoginBrowser(
+                        VERIFICATION_TTL_SECONDS,
+                        before_open=(lambda: self._before_request_hook(item.connection_lease, 40))
+                        if self._before_request_hook is not None and item.connection_lease is not None else None,
+                        after_open=(lambda: self._after_request_hook(item.connection_lease))
+                        if self._after_request_hook is not None and item.connection_lease is not None else None,
+                    )
+                except LoginBrowserBusy:
+                    raise XianyuLoginError("login_capacity", 3) from None
+                with self._lock:
+                    item.in_flight = False
+                    if self._items.get(login_id) is not item or float(self._clock()) >= item.expires_at:
+                        self._cleanup(item)
+                        raise XianyuLoginError("login_expired")
+                    return self._public(item, float(self._clock()))
             self._initialize_mtop(item, MTOP_BOOTSTRAP_URL, MTOP_BOOTSTRAP_API)
             item.login_form = self._call_json(
                 item, "GET", MINI_LOGIN_URL,
@@ -834,13 +866,19 @@ class XianyuLoginManager:
             return self._public(item, current_now)
 
     def qr_svg(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> bytes:
+        return self.qr_image(user_id, login_id, account_key)[0]
+
+    def qr_image(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> tuple[bytes, int]:
         item, _now = self._get(user_id, login_id, account_key)
         with self._lock:
             if item.status == "expired":
                 raise XianyuLoginError("login_expired")
+            if item.browser is not None:
+                snapshot = item.browser.snapshot()
+                return _validate_svg(snapshot["svg"]), snapshot["revision"]
             if not item.qr_svg:
                 raise XianyuLoginError("platform_error")
-            return bytes(item.qr_svg)
+            return bytes(item.qr_svg), 0
 
     def _initialize_mtop(self, item: _Login, url: str, api: str) -> None:
         self._call_json(
@@ -964,6 +1002,8 @@ class XianyuLoginManager:
 
     def poll(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID, *, _verification_check=False) -> dict:
         item, now = self._get(user_id, login_id, account_key)
+        if item.browser is not None:
+            return self._poll_browser(item, now)
         with self._lock:
             was_verification = item.status == "verification_required"
             if item.status in {"confirmed", "expired", "error"}:
@@ -1137,6 +1177,120 @@ class XianyuLoginManager:
                 self._close_session(item)
             return self._public(item, current_now)
 
+    def _poll_browser(self, item: _Login, now: float) -> dict:
+        with self._lock:
+            if self._items.get(item.login_id) is not item:
+                self._cleanup(item)
+                raise XianyuLoginError("login_not_found")
+            if item.status in {"confirmed", "expired", "error"}:
+                return self._public(item, now)
+            if item.in_flight:
+                raise XianyuLoginError("login_busy")
+            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
+            snapshot = item.browser.snapshot(credentials=True)
+            if snapshot["status"] == "error":
+                item.status = "error"
+                item.error_code = "verification_browser_unavailable"
+                result = self._public(item, now)
+                self._cleanup(item)
+                self._items.pop(item.login_id, None)
+                self._by_user.pop((item.user_id, item.account_key), None)
+                return result
+            if snapshot["status"] == "expired":
+                self._expire(item, now)
+                return self._public(item, now)
+            if snapshot["status"] != "confirmed":
+                item.status = snapshot["status"]
+                return self._public(item, now)
+            if item.last_poll_at and now - item.last_poll_at < 5:
+                return self._public(item, now)
+            item.in_flight = True
+            item.last_poll_at = now
+        try:
+            # Preserve browser cookie scope, expiry and flags. Never promote
+            # passport-only cookies to another host or accept a pasted URL.
+            if len(snapshot["cookies"]) > 256:
+                raise XianyuLoginError("platform_error")
+            for cookie in snapshot["cookies"]:
+                domain = str(cookie.get("domain") or "")
+                if domain.lstrip(".") != "goofish.com" and not domain.lstrip(".").endswith(".goofish.com"):
+                    continue
+                name, value = str(cookie.get("name") or ""), str(cookie.get("value") or "")
+                if not COOKIE_NAME_RE.fullmatch(name) or len(value) > 4096:
+                    continue
+                expiry = cookie.get("expires")
+                rest = {"HttpOnly": None} if cookie.get("httpOnly") else {}
+                if cookie.get("sameSite") in {"Lax", "Strict", "None"}:
+                    rest["SameSite"] = cookie["sameSite"]
+                imported = Cookie(
+                    version=0, name=name, value=value, port=None, port_specified=False,
+                    domain=domain, domain_specified=domain.startswith("."), domain_initial_dot=domain.startswith("."),
+                    path=str(cookie.get("path") or "/"), path_specified=True, secure=bool(cookie.get("secure")),
+                    expires=int(expiry) if expiry and expiry > 0 else None, discard=not bool(expiry and expiry > 0),
+                    comment=None, comment_url=None, rest=rest, rfc2109=False,
+                )
+                item.session.cookies.set_cookie(imported)
+            if snapshot["user_agent"]:
+                item.session.headers["User-Agent"] = snapshot["user_agent"]
+            header = self._confirm(item, "")
+        except (XianyuLoginError, ShopSyncError):
+            # Keep the human's completed browser session while a bounded
+            # platform initialization or egress lease is temporarily busy.
+            with self._lock:
+                item.in_flight = False
+                if self._items.get(item.login_id) is not item or float(self._clock()) >= item.expires_at:
+                    self._cleanup(item)
+            raise
+        except Exception:
+            with self._lock:
+                item.in_flight = False
+                if self._items.get(item.login_id) is not item or float(self._clock()) >= item.expires_at:
+                    self._cleanup(item)
+            raise XianyuLoginError("platform_error") from None
+        with self._lock:
+            item.in_flight = False
+            current_now = float(self._clock())
+            if self._items.get(item.login_id) is not item or current_now >= item.expires_at:
+                self._expire(item, current_now)
+                raise XianyuLoginError("login_expired")
+            try:
+                self._renew(item, self._confirmed_ttl + self._timeout + 10)
+            except XianyuLoginError:
+                self._expire(item, current_now)
+                raise
+            item.status = "confirmed"
+            item.cookie_header = header
+            item.expires_at = current_now + self._confirmed_ttl
+            item.browser.close()
+            item.browser = None
+            self._close_session(item)
+            LOGGER.warning("qr_official_browser_confirmed")
+            return self._public(item, current_now)
+
+    def browser_action(self, user_id, login_id, revision, points, account_key=DEFAULT_ACCOUNT_ID) -> dict:
+        item, now = self._get(user_id, login_id, account_key)
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise XianyuLoginError("invalid_request")
+        if not isinstance(points, list) or not 1 <= len(points) <= 80:
+            raise XianyuLoginError("invalid_request")
+        normalized = []
+        for point in points:
+            if not isinstance(point, (tuple, list)) or len(point) != 2:
+                raise XianyuLoginError("invalid_request")
+            if any(isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not 0 <= value <= 1 for value in point):
+                raise XianyuLoginError("invalid_request")
+            normalized.append((float(point[0]), float(point[1])))
+        with self._lock:
+            if item.status not in {"waiting", "scanned", "verification_required"} or item.browser is None:
+                raise XianyuLoginError("login_not_confirmed")
+            self._renew(item, max(1, item.expires_at - now) + self._timeout + 10)
+            from xianyu_login_browser import LoginBrowserBusy
+            try:
+                item.browser.action(revision, normalized)
+            except LoginBrowserBusy:
+                raise XianyuLoginError("login_busy", 1) from None
+            return {"accepted": True}
+
     def verification_url(self, user_id, login_id, account_key=DEFAULT_ACCOUNT_ID) -> str:
         item, now = self._get(user_id, login_id, account_key)
         with self._lock:
@@ -1165,6 +1319,8 @@ class XianyuLoginManager:
         item, now = self._get(user_id, login_id, account_key)
         digest = hashlib.sha256(callback_url.encode("ascii")).hexdigest()
         with self._lock:
+            if item.browser is not None:
+                raise XianyuLoginError("invalid_request")
             if item.status == "confirmed":
                 return self._public(item, now)
             if item.status != "verification_required":
