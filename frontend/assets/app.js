@@ -2107,6 +2107,9 @@
       const detail = data && typeof data === "object" ? data.detail : data;
       const message = detail && typeof detail === "object" ? detail.message : detail;
       const code = detail && typeof detail === "object" ? detail.code || "" : "";
+      if (type.toLowerCase().includes("text/html") || (typeof message === "string" && /^\s*(?:<!doctype|<html)/i.test(message))) {
+        throw new ApiError("工作台服务暂时不可用，请稍后重试。", response.status, "gateway_unavailable", { retryable: response.status >= 500 });
+      }
       throw new ApiError(message || "请求失败（" + response.status + "）", response.status, code, detail);
     }
     return data;
@@ -2539,7 +2542,9 @@
     const delay = typeof detail.retry_after === "number" && Number.isFinite(detail.retry_after)
       ? Math.max(0, Math.min(Math.ceil(detail.retry_after), 86400)) : 0;
     const remaining = qrRemaining(login.expiresAt);
-    const reusable = Boolean(login.loginId && remaining > delay && (
+    const sessionLost = [400, 401, 403, 404, 410].includes(error?.status)
+      || ["login_not_found", "login_expired", "login_consumed", "invalid_request"].includes(error?.code);
+    const reusable = Boolean(!sessionLost && login.loginId && remaining > delay && (
       action === "poll" || (action === "complete" && detail.can_retry_login === true)
     ));
     login.retryAction = reusable ? action : "start";
@@ -2902,7 +2907,12 @@
       }
     } catch (error) {
       if (state.qrLogin !== login) return;
-      applyQrLoginError(error, "poll");
+      if (login.browserMode && login.failures < 3 && qrRemaining(login.expiresAt)
+        && ([502, 503, 504].includes(error?.status) || ["gateway_unavailable", "network_error", "request_timeout"].includes(error?.code))) {
+        login.failures += 1;
+        login.message = "工作台连接暂时中断，正在重新检查登录状态。";
+        scheduleQrLoginPoll(generation, Math.min(6000, 1500 * (2 ** login.failures)));
+      } else applyQrLoginError(error, "poll");
       renderQrLogin();
     } finally {
       if (state.qrLogin === login) login.polling = false;
