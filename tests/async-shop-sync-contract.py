@@ -18,6 +18,8 @@ os.environ.update(
     {
         "SAAS_DB": str(RUN_DIR / "saas.db"),
         "SAAS_TENANTS_DIR": str(RUN_DIR / "tenants"),
+        # No executor marker is present; avoid macOS /var symlink traversal.
+        "SAAS_UPDATE_STATUS_DIR": str(Path("/tmp").resolve() / (RUN_DIR.name + "-missing-status")),
         "SAAS_COOKIE_SECURE": "0",
         "SAAS_RESTORE_WORKERS": "0",
         "SAAS_TESTING": "1",

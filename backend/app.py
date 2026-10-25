@@ -5310,7 +5310,12 @@ def sync_saved_shop(
 ):
     _require_permission(user, "shop.configure")
     account_key = str(account["account_key"])
-    if "respond-async" in request.headers.get("Prefer", "").lower():
+    # The local launcher intentionally omits the consumer in these modes.
+    # Honor a manual refresh inline instead of leaving it queued indefinitely.
+    local_without_consumer = _local_login_only() or os.environ.get(
+        "SAAS_LOCAL_OBSERVE_ONLY", "0"
+    ).strip().lower() in {"1", "true", "yes"}
+    if "respond-async" in request.headers.get("Prefer", "").lower() and not local_without_consumer:
         return _async_job_response(_enqueue_shop_refresh(user["id"], account), account)
     cookies = read_secret(user["id"], "cookies.txt", account_key)
     if not cookies:

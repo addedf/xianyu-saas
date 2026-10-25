@@ -210,6 +210,41 @@ def main() -> None:
         assert "local-shop" not in running
         assert local_only.json()["worker"]["code"] == "local_login_only"
 
+        # Both local launcher modes omit the consumer. A refresh requested by
+        # the browser must still fetch and persist fresh SKU data immediately.
+        assert client.post("/api/bot/stop", headers=headers).status_code == 200
+        sync_account = app.db.get_shop_account(user_id, account_key="local-shop")
+        refreshed = fake_shop_sync(local_only_cookie)
+        refreshed.update(synced_at="2026-10-25T01:00:00+0800", product_count=1)
+        refreshed["products"] = [{
+            "id": "100001", "title": "新多规格商品", "status": "在售",
+            "quantity": 2,
+            "skus": [{"sku_id": "600001", "name": "6S 16G WIFI",
+                      "price": "128.00", "stock": 2, "properties": []}],
+        }]
+        for mode in ("SAAS_LOCAL_LOGIN_ONLY", "SAAS_LOCAL_OBSERVE_ONLY"):
+            refresh_cookie = local_only_cookie + "; test_mode=" + mode
+            app.write_secret(user_id, "cookies.txt", refresh_cookie, "local-shop")
+            with (
+                patch.dict(os.environ, {"SAAS_LOCAL_LOGIN_ONLY": "0",
+                                        "SAAS_LOCAL_OBSERVE_ONLY": "0", mode: "1"}),
+                patch.object(app, "sync_shop", return_value=refreshed) as fetch,
+                patch.object(app, "_enqueue_shop_refresh", side_effect=AssertionError("no local consumer")),
+            ):
+                response = client.post("/api/bot/shop/sync", headers={**headers, "Prefer": "respond-async"})
+            assert response.status_code == 200, response.text
+            assert response.json()["synced_at"] == refreshed["synced_at"]
+            assert response.json()["product_count"] == 1
+            assert "job" not in response.json()
+            fetch.assert_called_once_with(refresh_cookie)
+            products = client.get("/api/bot/products", headers=headers).json()["products"]
+            assert products[0]["skus"][0]["price"] == "128.00"
+            assert products[0]["skus"][0]["stock"] == 2
+            assert "local-shop" not in running
+            assert starts["local-shop"] == 2
+            assert app.db.get_worker_runtime(user_id, sync_account["id"])["desired_state"] == "stopped"
+        app.write_secret(user_id, "cookies.txt", local_only_cookie, "local-shop")
+
         create_account(client, "unknown-shop")
         unknown_headers = {"X-Shop-Account": "unknown-shop"}
         candidate = "unb=620003; _m_h5_tk=candidate-token_tail; sid=candidate"
