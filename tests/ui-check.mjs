@@ -3444,7 +3444,8 @@ async function checkSkuDelivery(browser, baseUrl) {
   const skus = [5, 10, 20, 50, 100].map((amount, index) => ({
     sku_id: String(6000 + index), name: amount + "美元额度", price: String(amount * 7), stock: 3,
   }));
-  fixtures.products = [{ id: "100001", title: "多面额礼品卡", price_display: "¥35", quantity: 15, skus }];
+  fixtures.products = [{ id: "100001", title: "多面额礼品卡", price_display: "¥35", quantity: 15, skus,
+    status: "已下架", updated_at: "2026-10-25T08:48:00Z" }];
   fixtures.templates = [];
   fixtures.cards.pools = skus.map((sku, index) => ({ id: "pool-" + index, name: sku.name, available: 3, total: 3, used: 0 }));
   fixtures.deliveryStatusByAccount.default = { available: true, items: [
@@ -3456,6 +3457,9 @@ async function checkSkuDelivery(browser, baseUrl) {
     await openView(page, "goods");
     await page.waitForSelector(".product-skus tbody tr");
     assert.equal(await page.locator(".product-skus tbody tr").count(), 5);
+    assert.match(await page.locator("#productGrid .product-platform-meta").innerText(), /已下架.*同步于/s);
+    assert.match(await page.locator(".product-skus summary").innerText(), /平台库存 15/);
+    assert.match(await page.locator(".product-stock-note").innerText(), /卡密库存独立统计/);
     assert.match(await page.locator(".product-skus tbody tr").first().innerText(), /已绑定/);
     assert.match(await page.locator(".product-skus tbody tr").last().innerText(), /待绑定/);
     assert.equal(await page.locator("#productGrid [data-edit-delivery]").count(), 0);

@@ -3571,15 +3571,27 @@
     return '<button class="button button-secondary button-compact" type="button" data-edit-delivery data-item-id="' + esc(itemId) + '" aria-label="编辑' + esc(product.title || "未命名商品") + '的资料"><span>编辑资料</span></button>';
   }
 
+  function renderProductPlatformMeta(product) {
+    const status = String(product.status || "").trim();
+    const syncedAt = product.updated_at ? formatDate(product.updated_at) : "";
+    if (!status && !syncedAt) return "";
+    return '<div class="product-platform-meta">' +
+      (status ? '<span class="badge ' + (status === "在售" ? "badge-green" : "badge-muted") + '">' + esc(status) + '</span>' : "") +
+      (syncedAt ? '<small>同步于 ' + esc(syncedAt) + '</small>' : "") + '</div>';
+  }
+
   function renderProductSkus(product) {
     const skus = Array.isArray(product.skus) ? product.skus : [];
     if (!skus.length) return "";
+    const usesCardInventory = skus.some((sku) =>
+      state.deliveryStatus?.skuItems?.get(String(product.id) + ":" + String(sku.sku_id))?.delivery === "redeem");
     return '<details class="product-skus" open><summary>' + skus.length + ' 个规格 · 平台库存 ' + esc(product.quantity ?? "—") + '</summary>' +
       '<div class="product-sku-scroll"><table><thead><tr><th>规格</th><th>售价</th><th>平台库存</th><th>发货模板</th></tr></thead><tbody>' + skus.map((sku) => {
         const binding = state.deliveryStatus?.skuItems?.get(String(product.id) + ":" + String(sku.sku_id));
         const label = !binding ? "待绑定" : !binding.configured ? "待完善" : binding.enabled ? "已绑定" : "已暂停";
         return '<tr><td title="SKU ' + esc(sku.sku_id) + '">' + esc(sku.name) + '</td><td>¥' + esc(sku.price) + '</td><td>' + esc(sku.stock) + '</td><td>' + esc(label) + '</td></tr>';
-      }).join("") + '</tbody></table></div></details>';
+      }).join("") + '</tbody></table></div>' +
+      (usesCardInventory ? '<p class="product-stock-note">平台规格数量与卡密库存独立统计，卡密余量请查看“卡密库存”。</p>' : "") + '</details>';
   }
 
   function renderProducts() {
@@ -3741,7 +3753,7 @@
             '<div class="product-cell product-cell-main">' +
             productThumb(product, "product") +
             '<div><strong class="product-title" title="' + esc(product.title || "未命名商品") + '">' + esc(product.title || "未命名商品") + '</strong>' +
-            '<small class="product-desc">' + esc(product.description || "暂无商品简介") + "</small></div></div>" +
+            '<small class="product-desc">' + esc(product.description || "暂无商品简介") + "</small>" + renderProductPlatformMeta(product) + "</div></div>" +
             '<span class="product-price">' + esc(product.price_display || "价格待同步") + "</span>" +
             badge +
             '<div class="product-actions">' + actions + "</div>" + renderProductSkus(product) +
@@ -3768,6 +3780,7 @@
             "</div>" +
             '<div class="product-card-body">' +
             '<strong class="product-card-title" title="' + esc(product.title || "未命名商品") + '">' + esc(product.title || "未命名商品") + "</strong>" +
+            renderProductPlatformMeta(product) +
             '<div class="product-card-meta">' +
             '<span class="product-card-price">' + esc(product.price_display || "价格待同步") + "</span>" +
             badge +

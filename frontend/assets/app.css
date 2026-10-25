@@ -3643,6 +3643,21 @@ select { min-height: 34px; padding: 6px 8px; }
   justify-content: space-between;
   gap: 8px;
 }
+.product-platform-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.product-stock-note {
+  margin: 8px 0 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .product-card-price {
   font-size: 15px;
   font-weight: 800;
